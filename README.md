@@ -78,6 +78,7 @@ documentation-first project will all need different thresholds. Start with the d
 | `JEV_FACT` | 0.7 | How confidently a sentence must read as a factual claim to be checked at all. |
 | `JEV_FIRM` | 0.6 | Minimum confidence in Jev's own verdict before acting on it. Below this, it's logged but never blocks. |
 | `JEV_EVIDENCE_FLOOR` | 0.3 | See below. |
+| `JEV_MAX_TURNS_BACK` | 20 | How many user turns of evidence to keep. Lower = less stale-evidence noise in a long session, but a recap further back than this stops being checkable. |
 
 **On `JEV_EVIDENCE_FLOOR`:** a calibrated judge like Jev tells you whether the evidence you gave
 it *supports* a claim — it isn't built to *derive* an unstated fact, like tracing exactly what a
@@ -106,12 +107,15 @@ reasoning and a worked example.
   in `excerpt()` for the specific failure modes already found and fixed.
 - It only checks claims about the *current* session's evidence. A claim that's true but wasn't
   read this session will still get flagged as unsupported.
-- Evidence accumulates for the whole session, not just the latest turn, so a recap of earlier
-  work stays checkable. In a long session that covers several unrelated topics, this can backfire:
-  a new claim can match stale evidence from an earlier, unrelated part of the conversation on
-  generic keyword overlap alone, with no sense of which evidence is actually current. There's no
-  recency or topic-boundary signal yet — if you hit this, it usually shows up as a block whose
-  cited evidence is visibly about something else.
+- Evidence accumulates across a bounded window of recent turns (`JEV_MAX_TURNS_BACK`, default 20),
+  not the whole session, so a recap of earlier work stays checkable without pulling in everything
+  ever read. In a long session that covers several unrelated topics, a new claim can still match
+  stale evidence from earlier within that window on generic keyword overlap alone — the window
+  bounds this, it doesn't eliminate it, since there's still no topic-boundary signal. If you hit
+  this, it usually shows up as a block whose cited evidence is visibly about something else.
+- The keyword matcher covers Latin identifiers and any other script's letters (e.g. Cyrillic) as
+  of the current version — but it's still exact-word matching, not semantic, so it still misses a
+  claim phrased differently from its supporting evidence, in any language.
 - It's excerpts, not full files — see "What it sends" above.
 
 ## License

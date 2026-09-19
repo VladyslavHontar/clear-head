@@ -3,3 +3,4 @@ log.jsonl
 sent.jsonl
 __pycache__/
 *.pyc
+.claude/

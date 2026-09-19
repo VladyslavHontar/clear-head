@@ -62,11 +62,16 @@ def text_of(c):
     return "\n".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
 
 
+MAX_TURNS_BACK = int(os.environ.get("JEV_MAX_TURNS_BACK", 20))
+
+
 def last_turn(path):
-    """(final assistant text, evidence lines, reads) — evidence accumulates across the whole
-    session (not just the latest turn) so a recap of earlier work stays checkable; only the
-    answer resets on a new user message."""
-    answer, lines, reads = "", [], []
+    """(final assistant text, evidence lines, reads) — evidence accumulates across recent turns
+    (not just the latest one) so a recap of earlier work stays checkable; only the answer resets
+    on a new user message. Bounded to the last MAX_TURNS_BACK user turns: unbounded accumulation
+    in a long, multi-topic session lets a new claim match stale evidence from an unrelated earlier
+    part of the conversation on generic keyword overlap alone — see README Known limits."""
+    answer, all_lines, all_reads, turn = "", [], [], 0
     for raw in open(path):
         try:
             d = json.loads(raw)
@@ -77,16 +82,19 @@ def last_turn(path):
             if isinstance(c, list) and any(b.get("type") == "tool_result" for b in c):
                 for b in c:
                     if b.get("type") == "tool_result":
-                        lines += [l.strip()[:LINE_CAP] for l in text_of(b.get("content") or "").splitlines() if l.strip()]
+                        all_lines += [(turn, l.strip()[:LINE_CAP]) for l in text_of(b.get("content") or "").splitlines() if l.strip()]
             elif text_of(c or "").strip():
-                answer = ""
+                answer = ""; turn += 1
         elif d.get("type") == "assistant":
             for b in m.get("content", []):
                 if b.get("type") == "text" and len(b["text"]) > 200:
                     answer = b["text"]
                 elif b.get("type") == "tool_use":
                     i = b.get("input", {})
-                    reads.append((i.get("file_path") or i.get("command") or i.get("query") or i.get("args") or "")[:200])
+                    all_reads.append((turn, (i.get("file_path") or i.get("command") or i.get("query") or i.get("args") or "")[:200]))
+    cutoff = turn - MAX_TURNS_BACK
+    lines = [l for t, l in all_lines if t >= cutoff]
+    reads = [r for t, r in all_reads if t >= cutoff]
     return answer, lines, reads
 
 
@@ -98,7 +106,10 @@ def sentences(t):
 
 def keywords(s):
     s = re.sub(r"([a-z])([A-Z])", r"\1 \2", s).replace("_", " ").lower()
-    return {w for w in re.findall(r"[a-z][a-z0-9]{2,}|\d{2,}", s) if w not in STOP}
+    # ascii identifiers (letters+digits, e.g. "sha256") | any OTHER script's letters run 3+ (e.g. Cyrillic —
+    # a claim written in a non-Latin language previously got ZERO keywords and so zero coverage, always
+    # below EVIDENCE_FLOOR, always blockable regardless of truth | bare numbers
+    return {w for w in re.findall(r"[a-z][a-z0-9]{2,}|[^\W\da-z]{3,}|\d{2,}", s) if w not in STOP}
 
 
 def excerpt(claim, lines, kws, idf):
@@ -165,7 +176,7 @@ def main():
     q1 = {str(i): {"type": "choice", "instructions": f"Sentence: {s}",
           "criteria": {"fact_about_existing_code": "asserts how the code/system currently is or behaves (present tense, checkable in the repo)",
                        "proposal_or_opinion": "recommends, proposes, predicts, or describes a design that does not exist yet",
-                       "about_this_conversation": "describes what was done, found, built, or decided during this session, or what the user should do next",
+                       "about_this_conversation": "describes what was done, found, built, or decided during this session, what the user should do next, or asserts that something was NOT done, tested, or verified (this session or in general) — there is no code to check a claim of absent action against",
                        "other": "general knowledge, meta commentary, headings, or list fragments"}}
           for i, s in enumerate(sents)}
     a1 = jev({"context": "Sentences from an AI assistant's answer about a software codebase. Classify each sentence "
