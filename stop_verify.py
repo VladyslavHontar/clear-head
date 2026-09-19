@@ -262,6 +262,13 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception as e:  # never block a turn because the checker itself broke
+    except Exception as e:
         with open(LOG, "a") as f:
             f.write(json.dumps({"ts": time.time(), "error": str(e)}) + "\n")
+        # fail-open by default (a broken checker shouldn't block real work) — flip with
+        # JEV_FAIL_CLOSED=1 if you'd rather know the check didn't run than risk it silently
+        # not running (pattern borrowed from jev-guard's JEV_GUARD_FAIL_CLOSED)
+        if os.environ.get("JEV_FAIL_CLOSED"):
+            print(json.dumps({"decision": "block", "reason":
+                f"Jev claim check itself failed and JEV_FAIL_CLOSED is set: {e}\n"
+                "Unset JEV_FAIL_CLOSED to fail open instead, or fix the underlying error."}))

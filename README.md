@@ -79,6 +79,7 @@ documentation-first project will all need different thresholds. Start with the d
 | `JEV_FIRM` | 0.6 | Minimum confidence in Jev's own verdict before acting on it. Below this, it's logged but never blocks. |
 | `JEV_EVIDENCE_FLOOR` | 0.3 | See below. |
 | `JEV_MAX_TURNS_BACK` | 20 | How many user turns of evidence to keep. Lower = less stale-evidence noise in a long session, but a recap further back than this stops being checkable. |
+| `JEV_FAIL_CLOSED` | unset | If the checker itself throws (network down, bad key, malformed input), fail open by default — never block real work over a broken checker. Set this if you'd rather know the check didn't run than risk it silently not running. |
 
 **On `JEV_EVIDENCE_FLOOR`:** a calibrated judge like Jev tells you whether the evidence you gave
 it *supports* a claim — it isn't built to *derive* an unstated fact, like tracing exactly what a
