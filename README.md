@@ -96,6 +96,10 @@ reasoning and a worked example.
    existing system, a proposal, a recap of the conversation, or neither.
 3. For every factual claim, retrieve the tool-output lines most likely to bear on it (a small,
    keyword-and-frequency retriever — see `excerpt()`), plus any doc comments found this session.
+   Each line is tagged with the file or command that produced it, matched by tool call id rather
+   than position — so a line from one file can't get mistaken for evidence about another. This
+   doesn't disambiguate *within* a single command's combined output (e.g. two refs in one `git
+   log` dump still need the position-boost in `excerpt()` to tell apart).
 4. Ask Jev whether the evidence supports, contradicts, or doesn't address each claim.
 5. Block the turn if anything is contradicted, or unsupported with no relevant evidence found at
    all (see the coverage note above).

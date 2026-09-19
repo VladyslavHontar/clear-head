@@ -71,7 +71,7 @@ def last_turn(path):
     on a new user message. Bounded to the last MAX_TURNS_BACK user turns: unbounded accumulation
     in a long, multi-topic session lets a new claim match stale evidence from an unrelated earlier
     part of the conversation on generic keyword overlap alone — see README Known limits."""
-    answer, all_lines, all_reads, turn = "", [], [], 0
+    answer, all_lines, all_reads, turn, tool_desc = "", [], [], 0, {}
     for raw in open(path):
         try:
             d = json.loads(raw)
@@ -82,7 +82,13 @@ def last_turn(path):
             if isinstance(c, list) and any(b.get("type") == "tool_result" for b in c):
                 for b in c:
                     if b.get("type") == "tool_result":
-                        all_lines += [(turn, l.strip()[:LINE_CAP]) for l in text_of(b.get("content") or "").splitlines() if l.strip()]
+                        # tag each line with WHERE it came from (matched by tool_use_id, not
+                        # position) — an anonymous line and a line tagged "[stop_verify.py]" are
+                        # very different evidence; without the tag a claim about file A can be
+                        # "confirmed" by a same-keyword line that actually came from file B
+                        src = tool_desc.get(b.get("tool_use_id"), "")
+                        tag = f"[{src}] " if src else ""
+                        all_lines += [(turn, (tag + l.strip())[:LINE_CAP]) for l in text_of(b.get("content") or "").splitlines() if l.strip()]
             elif text_of(c or "").strip():
                 answer = ""; turn += 1
         elif d.get("type") == "assistant":
@@ -91,7 +97,10 @@ def last_turn(path):
                     answer = b["text"]
                 elif b.get("type") == "tool_use":
                     i = b.get("input", {})
-                    all_reads.append((turn, (i.get("file_path") or i.get("command") or i.get("query") or i.get("args") or "")[:200]))
+                    desc = (i.get("file_path") or i.get("command") or i.get("query") or i.get("args") or "")
+                    all_reads.append((turn, desc[:200]))
+                    if b.get("id"):
+                        tool_desc[b["id"]] = desc[:60]
     cutoff = turn - MAX_TURNS_BACK
     lines = [l for t, l in all_lines if t >= cutoff]
     reads = [r for t, r in all_reads if t >= cutoff]
@@ -152,7 +161,8 @@ def doc_lines(lines):
     design intent or known limitations in a codebase, worth sending on every claim."""
     seen, out, used = set(), [], 0
     for l in lines:
-        core = re.sub(r"^\S*[:\-]\d+[:\-]\s*", "", l)  # strip a leading "path:NN:" grep prefix
+        core = re.sub(r"^\[[^\]]*\]\s*", "", l)              # strip the "[source] " tag
+        core = re.sub(r"^\S*[:\-]\d+[:\-]\s*", "", core)      # strip a leading "path:NN:" grep prefix
         if re.match(r"(//[!/]|\"\"\"|#!)", core) and core not in seen and len(core) > 20:
             seen.add(core); out.append(core); used += len(core)
             if used > DOC_CHARS:
