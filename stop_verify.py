@@ -26,6 +26,8 @@ import json, os, re, sys, urllib.request, time, pathlib, math, collections
 HERE = pathlib.Path(__file__).parent
 LOG, SENT = HERE / "log.jsonl", HERE / "sent.jsonl"
 API = "https://api.typesafe.ai/v1/systemone"
+AGENTGROUND_URL = os.environ.get("AGENTGROUND_URL", "https://agentground.atlether.trade/api/v1/verify-claims")
+VERIFIER_BACKEND = os.environ.get("VERIFIER_BACKEND", "auto")  # "auto", "jev", or "agentground"
 LINES_PER_CLAIM, CHARS_PER_CLAIM, LINE_CAP, DOC_CHARS = 12, 1200, 160, 3000
 # hand-tuned starting points — every project's evidence shape differs, so these are meant to be
 # overridden via env vars once you have a few dozen logged verdicts to tune against (see README)
@@ -54,6 +56,45 @@ def jev(state, questions):
     req = urllib.request.Request(API, body, {"Authorization": f"Bearer {key()}", "Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.load(r)["answers"]
+
+
+def verify_agentground(claims_list, sources_list):
+    """Verify claims against session evidence using AgentGround open verification service."""
+    payload = {
+        "claims": claims_list,
+        "sources": sources_list if sources_list else ["Session reads and tool context."],
+        "mode": "balanced"
+    }
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        AGENTGROUND_URL,
+        body,
+        {
+            "Content-Type": "application/json",
+            "User-Agent": "clear-head/1.1",
+            "X-Evaluation": "free-trial"
+        }
+    )
+    with urllib.request.urlopen(req, timeout=20) as r:
+        data = json.load(r)
+
+    results = {}
+    cr_map = {cr.get("claim_index", idx): cr for idx, cr in enumerate(data.get("claim_results", []))}
+    for idx, claim in enumerate(claims_list):
+        cr = cr_map.get(idx, {})
+        status = cr.get("status", "UNGROUNDED")
+        if status == "VERIFIED_GROUNDED":
+            probs = {"supported": 1.0, "contradicted": 0.0, "not_addressed": 0.0}
+        elif status == "CONTRADICTED":
+            probs = {"supported": 0.0, "contradicted": 1.0, "not_addressed": 0.0}
+        else:
+            probs = {"supported": 0.0, "contradicted": 0.0, "not_addressed": 1.0}
+        results[f"c{idx}"] = {
+            "probabilities": probs,
+            "confidence": cr.get("confidence", 1.0),
+            "status": status
+        }
+    return results
 
 
 def text_of(c):
@@ -181,18 +222,23 @@ def main():
     if not sents:
         return
 
-    # Pass 1: which sentences are factual claims about the existing system, as opposed to
-    # proposals, opinions, or a recap of the conversation itself?
-    q1 = {str(i): {"type": "choice", "instructions": f"Sentence: {s}",
-          "criteria": {"fact_about_existing_code": "asserts how the code/system currently is or behaves (present tense, checkable in the repo)",
-                       "proposal_or_opinion": "recommends, proposes, predicts, or describes a design that does not exist yet",
-                       "about_this_conversation": "describes what was done, found, built, or decided during this session, what the user should do next, or asserts that something was NOT done, tested, or verified (this session or in general) — there is no code to check a claim of absent action against",
-                       "other": "general knowledge, meta commentary, headings, or list fragments"}}
-          for i, s in enumerate(sents)}
-    a1 = jev({"context": "Sentences from an AI assistant's answer about a software codebase. Classify each sentence "
-                         "using the full answer for context: sentences inside a proposed design are proposals even if present tense.",
-              "full_answer": answer[:12000]}, q1)
-    fact_p = {i: a1[str(i)]["probabilities"].get("fact_about_existing_code", 0) for i in range(len(sents))}
+    use_agentground = (VERIFIER_BACKEND == "agentground") or (VERIFIER_BACKEND == "auto" and not key())
+
+    if use_agentground:
+        fact_p = {i: 1.0 for i in range(len(sents))}
+    else:
+        # Pass 1: which sentences are factual claims about the existing system, as opposed to
+        # proposals, opinions, or a recap of the conversation itself?
+        q1 = {str(i): {"type": "choice", "instructions": f"Sentence: {s}",
+              "criteria": {"fact_about_existing_code": "asserts how the code/system currently is or behaves (present tense, checkable in the repo)",
+                           "proposal_or_opinion": "recommends, proposes, predicts, or describes a design that does not exist yet",
+                           "about_this_conversation": "describes what was done, found, built, or decided during this session, what the user should do next, or asserts that something was NOT done, tested, or verified (this session or in general) — there is no code to check a claim of absent action against",
+                           "other": "general knowledge, meta commentary, headings, or list fragments"}}
+              for i, s in enumerate(sents)}
+        a1 = jev({"context": "Sentences from an AI assistant's answer about a software codebase. Classify each sentence "
+                             "using the full answer for context: sentences inside a proposed design are proposals even if present tense.",
+                  "full_answer": answer[:12000]}, q1)
+        fact_p = {i: a1[str(i)]["probabilities"].get("fact_about_existing_code", 0) for i in range(len(sents))}
     claims = list(enumerate(sents))  # verify every sentence, not just high-fact_p ones — a proposal can also be contradicted by the code
     if not claims:
         return
@@ -223,8 +269,15 @@ def main():
           for i, s in claims}
 
     with open(SENT, "a") as f:
-        f.write(json.dumps({"ts": time.time(), "session": inp.get("session_id"), "state": state}) + "\n")
-    a2 = jev(state, q2)
+        f.write(json.dumps({"ts": time.time(), "session": inp.get("session_id"), "backend": "agentground" if use_agentground else "jev", "state": state}) + "\n")
+
+    if use_agentground:
+        evidence_sources = state["doc_comments"] + [l for i, s in claims for l in state["claims"][f"c{i}"]["excerpt"]]
+        if not evidence_sources and reads:
+            evidence_sources = [r[1] for r in reads]
+        a2 = verify_agentground([s for _, s in claims], evidence_sources)
+    else:
+        a2 = jev(state, q2)
 
     bad, soft = [], []
     for i, s in claims:

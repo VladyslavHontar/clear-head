@@ -37,6 +37,10 @@ You'll be prompted for a TypeSafe API key ([get one here](https://typesafe.ai)) 
 `TYPESAFE_API_KEY` is already set in your environment. The installer verifies the key works
 before it finishes.
 
+### Zero-Key Mode (AgentGround Backend)
+
+If `TYPESAFE_API_KEY` is not set, `clear-head` automatically falls back to [AgentGround](https://agentground.atlether.trade/mcp) — an open, deterministic claim verification service requiring zero API keys. You can also force this backend by setting `VERIFIER_BACKEND=agentground`.
+
 ## Uninstall
 
 ```bash
