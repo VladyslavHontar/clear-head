@@ -27,10 +27,6 @@ Env vars:
   JEV_FAIL_CLOSED        block (instead of failing open) if the checker itself errors
   VERIFIER_BACKEND       "jev" (default, cloud) or "laya" (local) — see README's Laya section
   LAYA_HOST / LAYA_PORT  where laya_server.py listens (default 127.0.0.1:8787)
-  LAYA_FIRM              same as JEV_FIRM but for the laya backend — separate on purpose, see
-                         the comment above FIRM: a threshold tuned for one model's calibration
-                         isn't safe to reuse for a different one (default 0.6, likely too high —
-                         calibrate from your own log.jsonl once you have real verdicts)
 """
 import json, os, re, sys, urllib.request, time, pathlib, math, collections
 
@@ -44,6 +40,7 @@ LINES_PER_CLAIM, CHARS_PER_CLAIM, LINE_CAP, DOC_CHARS = 12, 1200, 160, 3000
 THRESH = float(os.environ.get("JEV_THRESH", 0.7))
 CONTRA = float(os.environ.get("JEV_CONTRA", 0.5))
 FACT = float(os.environ.get("JEV_FACT", 0.7))
+FIRM = float(os.environ.get("JEV_FIRM", 0.6))
 EVIDENCE_FLOOR = float(os.environ.get("JEV_EVIDENCE_FLOOR", 0.3))
 STOP = set("this that with from have does into only also than then they were been what when which their about there these those would could should".split())
 
@@ -70,11 +67,6 @@ def key():
 # Same env-then-.env lookup as key(), so `install.sh --laya` can persist the choice reliably —
 # a plain shell `export` may not reach the hook if Claude Code wasn't launched from that shell.
 VERIFIER_BACKEND = _config("VERIFIER_BACKEND", "jev")  # "jev" or "laya"
-# Separate from JEV_FIRM: different models calibrate confidence differently, so borrowing one
-# model's threshold for another isn't safe. Laya measured well below Jev's on real claims here
-# (0.05-0.13 vs 0.32-0.99, and pointed the wrong way on one case) — needs its OWN threshold,
-# tuned from its own log.jsonl data, not inherited from Jev's default.
-FIRM = float(os.environ.get("LAYA_FIRM" if VERIFIER_BACKEND == "laya" else "JEV_FIRM", 0.6))
 
 
 def jev(state, questions):
