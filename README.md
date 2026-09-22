@@ -69,6 +69,17 @@ this hook makes for you.
 Switch backends any time by editing `VERIFIER_BACKEND` in the installed `.env` (`jev` or
 `laya`), or per-shell with `VERIFIER_BACKEND=laya`.
 
+**Honest status: not a drop-in replacement for Jev yet.** A real (small, n=3) spot-check against
+Jev on this project's own past claims — same evidence, same question wording — showed Laya's
+confidence running far below Jev's (0.05-0.13 vs 0.32-0.99) and, on one claim, pointing the wrong
+direction. `LAYA_FIRM` exists specifically so a too-high shared threshold doesn't just silently
+discard every Laya verdict, but lowering it alone doesn't fix accuracy — it just makes the hook
+act on a less certain signal. Two things nobody has done yet: tune `LAYA_FIRM`/`LAYA_CONTRA`
+against your own `log.jsonl` once you have real verdicts logged, and rewrite the question wording
+in `main()` for Laya specifically — every prompt in this hook was iterated against Jev's behavior
+all day and never touched for Laya. Treat it as a genuinely free, local, faster option worth
+having — not yet as equivalent to the default.
+
 ## Uninstall
 
 ```bash
