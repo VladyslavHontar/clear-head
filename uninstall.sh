@@ -36,6 +36,13 @@ print(f"Removed {removed} hook entry from {settings_path}" if removed == 1 else
       f"Removed {removed} hook entries from {settings_path}")
 PY
 
+if curl -s -o /dev/null -m 1 "http://127.0.0.1:${LAYA_PORT:-8787}/health" 2>/dev/null; then
+  PID=$(lsof -ti tcp:"${LAYA_PORT:-8787}" 2>/dev/null || true)
+  if [ -n "$PID" ]; then
+    kill "$PID" && echo "Stopped laya_server.py (pid $PID)"
+  fi
+fi
+
 if [ -d "$TARGET_DIR" ]; then
   read -rp "Also delete $TARGET_DIR (script, logs, API key)? [y/N] " ans
   if [[ "$ans" =~ ^[Yy]$ ]]; then

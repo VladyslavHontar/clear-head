@@ -1,31 +1,39 @@
 #!/usr/bin/env python3
 """Claude Code Stop hook: checks the final answer's factual claims against evidence actually
-read this session, using TypeSafe's Jev (https://typesafe.ai) as a fast, cheap judge. Blocks
-the turn from ending (decision=block) when a claim is contradicted by, or unsupported by,
-anything that was read.
+read this session, using a fast, cheap typed-decision judge — TypeSafe's Jev (cloud,
+https://typesafe.ai) or Laya (local, free, https://github.com/NandhaKishorM/laya). Blocks the
+turn from ending (decision=block) when a claim is contradicted by, or unsupported by, anything
+that was read.
 
 Sends EXCERPTS only — small, keyword-matched snippets of tool output per claim, plus a list
 of file paths/commands used this session — never whole files. Every payload sent is logged to
-sent.jsonl next to this script so you can audit exactly what left the machine.
+sent.jsonl next to this script so you can audit exactly what left the machine. On the jev
+backend that means TypeSafe's API; on the laya backend nothing leaves this machine at all.
+The backend is always an explicit choice (VERIFIER_BACKEND) — never a silent fallback.
 
-Setup: run install.sh, or set TYPESAFE_API_KEY in the environment (or a .env file next to this
-script) and register this script as a Stop hook command in Claude Code settings.
+Setup: run install.sh (or install.sh --laya for the local backend), or configure
+TYPESAFE_API_KEY / VERIFIER_BACKEND in the environment or a .env file next to this script, and
+register this script as a Stop hook command in Claude Code settings.
 
 Env vars:
   JEV_HOOK=off           disable for this shell (useful for an A/B comparison, or sensitive work)
   JEV_THRESH             not-addressed threshold to flag a claim as unsupported (default 0.7)
   JEV_CONTRA             contradiction threshold to block (default 0.5)
   JEV_FACT               how confidently a sentence must read as a factual claim to be checked (default 0.7)
-  JEV_FIRM               minimum Jev confidence in its own verdict to act on it (default 0.6)
+  JEV_FIRM               minimum confidence in the judge's own verdict to act on it (default 0.6)
   JEV_EVIDENCE_FLOOR     coverage floor below which "not addressed" means nothing relevant was
                          found at all, vs. relevant evidence existing but not proving the claim
                          (default 0.3) — see the comment above EVIDENCE_FLOOR for why this exists
+  JEV_FAIL_CLOSED        block (instead of failing open) if the checker itself errors
+  VERIFIER_BACKEND       "jev" (default, cloud) or "laya" (local) — see README's Laya section
+  LAYA_HOST / LAYA_PORT  where laya_server.py listens (default 127.0.0.1:8787)
 """
 import json, os, re, sys, urllib.request, time, pathlib, math, collections
 
 HERE = pathlib.Path(__file__).parent
 LOG, SENT = HERE / "log.jsonl", HERE / "sent.jsonl"
 API = "https://api.typesafe.ai/v1/systemone"
+LAYA_URL = f"http://{os.environ.get('LAYA_HOST', '127.0.0.1')}:{os.environ.get('LAYA_PORT', '8787')}/predict"
 LINES_PER_CLAIM, CHARS_PER_CLAIM, LINE_CAP, DOC_CHARS = 12, 1200, 160, 3000
 # hand-tuned starting points — every project's evidence shape differs, so these are meant to be
 # overridden via env vars once you have a few dozen logged verdicts to tune against (see README)
@@ -37,16 +45,28 @@ EVIDENCE_FLOOR = float(os.environ.get("JEV_EVIDENCE_FLOOR", 0.3))
 STOP = set("this that with from have does into only also than then they were been what when which their about there these those would could should".split())
 
 
-def key():
-    env = os.environ.get("TYPESAFE_API_KEY", "")
+def _config(var, default=""):
+    env = os.environ.get(var, "")
     if env:
         return env
     envfile = HERE / ".env"
     if envfile.exists():
         for line in envfile.read_text().splitlines():
-            if line.startswith("TYPESAFE_API_KEY="):
+            if line.startswith(var + "="):
                 return line.split("=", 1)[1].strip()
-    return ""
+    return default
+
+
+def key():
+    return _config("TYPESAFE_API_KEY")
+
+
+# Explicit choice only — never a silent fallback triggered by a missing key or anything else.
+# A hook that decides on its own where your session evidence goes, instead of where you told it
+# to go, is exactly the failure mode to avoid (see the rejected AgentGround PR in project history).
+# Same env-then-.env lookup as key(), so `install.sh --laya` can persist the choice reliably —
+# a plain shell `export` may not reach the hook if Claude Code wasn't launched from that shell.
+VERIFIER_BACKEND = _config("VERIFIER_BACKEND", "jev")  # "jev" or "laya"
 
 
 def jev(state, questions):
@@ -54,6 +74,27 @@ def jev(state, questions):
     req = urllib.request.Request(API, body, {"Authorization": f"Bearer {key()}", "Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.load(r)["answers"]
+
+
+def laya(state, questions):
+    # laya_server.py keeps the model warm in a long-lived process; this is just a fast localhost
+    # call, same latency profile as the jev() HTTP path. Never leaves the machine.
+    body = json.dumps({"state": state, "questions": questions}).encode()
+    req = urllib.request.Request(LAYA_URL, body, {"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.load(r)  # laya_server.py already unwraps to just the answers dict
+    except urllib.error.URLError as e:
+        raise RuntimeError(
+            f"VERIFIER_BACKEND=laya but {LAYA_URL} isn't reachable ({e}). "
+            "Start it first: pip install laya && python3 laya_server.py &"
+        ) from e
+
+
+def judge(state, questions):
+    """Single dispatch point — adding a third backend later means one more function and one
+    more branch here, not scattered if/else through main() (see the rejected AgentGround PR)."""
+    return laya(state, questions) if VERIFIER_BACKEND == "laya" else jev(state, questions)
 
 
 def text_of(c):
@@ -189,7 +230,7 @@ def main():
                        "about_this_conversation": "describes what was done, found, built, or decided during this session, what the user should do next, or asserts that something was NOT done, tested, or verified (this session or in general) — there is no code to check a claim of absent action against",
                        "other": "general knowledge, meta commentary, headings, or list fragments"}}
           for i, s in enumerate(sents)}
-    a1 = jev({"context": "Sentences from an AI assistant's answer about a software codebase. Classify each sentence "
+    a1 = judge({"context": "Sentences from an AI assistant's answer about a software codebase. Classify each sentence "
                          "using the full answer for context: sentences inside a proposed design are proposals even if present tense.",
               "full_answer": answer[:12000]}, q1)
     fact_p = {i: a1[str(i)]["probabilities"].get("fact_about_existing_code", 0) for i in range(len(sents))}
@@ -224,7 +265,7 @@ def main():
 
     with open(SENT, "a") as f:
         f.write(json.dumps({"ts": time.time(), "session": inp.get("session_id"), "state": state}) + "\n")
-    a2 = jev(state, q2)
+    a2 = judge(state, q2)
 
     bad, soft = [], []
     for i, s in claims:
