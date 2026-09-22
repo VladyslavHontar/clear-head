@@ -37,38 +37,6 @@ You'll be prompted for a TypeSafe API key ([get one here](https://typesafe.ai)) 
 `TYPESAFE_API_KEY` is already set in your environment. The installer verifies the key works
 before it finishes.
 
-### Laya backend (local, free, no API key)
-
-```bash
-./install.sh --laya
-```
-
-Uses [Laya](https://github.com/NandhaKishorM/laya) — a local, Apache-2.0, self-hostable model
-with the same choice/score/noul primitives as Jev — instead of TypeSafe's cloud API. Nothing
-leaves your machine on this backend. Its own [benchmarks](https://github.com/NandhaKishorM/laya/blob/main/BENCHMARKS.md)
-compare it against Jev, but by their own admission those numbers are against third-party
-published Jev figures, not a controlled head-to-head — treat them as indicative, not settled.
-
-`--laya` installs `pip install laya` (downloads model weights, several hundred MB to a few GB
-depending on checkpoint) and starts `laya_server.py` in the background. **Why a server and not
-a plain library import:** the hook runs as a fresh process on every Claude Code turn. Importing
-Laya and loading its weights inside `stop_verify.py` directly would pay that load cost — real
-seconds, more on CPU — on every single stop. `laya_server.py` loads the model once and stays
-warm; the hook just makes a fast localhost call, the same latency shape as the Jev backend.
-
-The server doesn't survive a reboot. Restart it with:
-```bash
-python3 ~/.claude/hooks/jev/laya_server.py &
-```
-or wire it into your own startup process (a `launchd`/`systemd` user service, tmux session,
-whatever you already use to keep background processes alive across reboots — not something this
-project prescribes for you). It only binds to `127.0.0.1` — leave `LAYA_HOST` alone unless you
-specifically want to serve inference to your network, which is a different, larger decision than
-this hook makes for you.
-
-Switch backends any time by editing `VERIFIER_BACKEND` in the installed `.env` (`jev` or
-`laya`), or per-shell with `VERIFIER_BACKEND=laya`.
-
 ## Uninstall
 
 ```bash
@@ -112,8 +80,6 @@ documentation-first project will all need different thresholds. Start with the d
 | `JEV_EVIDENCE_FLOOR` | 0.3 | See below. |
 | `JEV_MAX_TURNS_BACK` | 20 | How many user turns of evidence to keep. Lower = less stale-evidence noise in a long session, but a recap further back than this stops being checkable. |
 | `JEV_FAIL_CLOSED` | unset | If the checker itself throws (network down, bad key, malformed input), fail open by default — never block real work over a broken checker. Set this if you'd rather know the check didn't run than risk it silently not running. |
-| `VERIFIER_BACKEND` | `jev` | `jev` (cloud) or `laya` (local). Persisted in `.env` by `install.sh --laya` the same way as the API key — see the Laya section above. |
-| `LAYA_HOST` / `LAYA_PORT` | `127.0.0.1` / `8787` | Where `laya_server.py` listens and where the hook looks for it. Keep the host local. |
 
 **On `JEV_EVIDENCE_FLOOR`:** a calibrated judge like Jev tells you whether the evidence you gave
 it *supports* a claim — it isn't built to *derive* an unstated fact, like tracing exactly what a
