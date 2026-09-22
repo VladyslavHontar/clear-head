@@ -73,8 +73,13 @@ VERIFIER_BACKEND = _config("VERIFIER_BACKEND", "jev")  # "jev" or "laya"
 # Separate from JEV_FIRM: different models calibrate confidence differently, so borrowing one
 # model's threshold for another isn't safe. Laya measured well below Jev's on real claims here
 # (0.05-0.13 vs 0.32-0.99, and pointed the wrong way on one case) — needs its OWN threshold,
-# tuned from its own log.jsonl data, not inherited from Jev's default.
-FIRM = float(os.environ.get("LAYA_FIRM" if VERIFIER_BACKEND == "laya" else "JEV_FIRM", 0.6))
+# tuned from its own log.jsonl data, not inherited from Jev's default. 0.6 (Jev's threshold)
+# silences Laya entirely: a clean-cut synthetic contradiction ("the sky is green" vs "the sky is
+# blue") scored confidence=0.24 — below 0.6 even on an unambiguous case. 0.15 is a provisional
+# floor, not a calibrated one — it exists so *something* reaches CONTRA/THRESH while log.jsonl
+# accumulates real confidence numbers (now logged per-claim) to calibrate this properly.
+FIRM = float(os.environ.get("LAYA_FIRM", 0.15) if VERIFIER_BACKEND == "laya"
+             else os.environ.get("JEV_FIRM", 0.6))
 
 
 def jev(state, questions):
@@ -299,7 +304,8 @@ def main():
         f.write(json.dumps({"ts": time.time(), "session": inp.get("session_id"), "n_sent": len(sents), "n_claims": len(claims),
                             "blocked": bool(bad), "fact_p": {s: round(fact_p[i], 2) for i, s in claims},
                             "coverage": {s: round(coverage[i], 2) for i, s in claims}, "soft": len(soft),
-                            "verdicts": {s: a2[f"c{i}"]["probabilities"] for i, s in claims}}) + "\n")
+                            "verdicts": {s: a2[f"c{i}"]["probabilities"] for i, s in claims},
+                            "confidence": {s: a2[f"c{i}"].get("confidence") for i, s in claims}}) + "\n")
 
     if bad:
         print(json.dumps({"decision": "block", "reason":
