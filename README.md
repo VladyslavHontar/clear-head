@@ -120,6 +120,8 @@ documentation-first project will all need different thresholds. Start with the d
 | `VERIFIER_BACKEND` | `jev` | `jev` (TypeSafe's API) or `kev` (local). Always explicit — an unknown name fails loudly rather than falling back. Persisted in `.env` by `install.sh --kev`. |
 | `KEV_FIRM` | 0.5 | `JEV_FIRM` for the Kev backend — separate because the two models' confidence scales differ. 0.5 is where Kev's "contradicted" verdicts agreed with Jev most often on 1309 replayed claims (47%, vs 27% at 0.15). |
 | `KEV_PORT` | 8009 | Where `kev.serve` listens (always on 127.0.0.1). |
+| `JEV_MUTABLE` | 0.6 | How surely a sentence must read as a claim about *mutable outside state* — a PR or issue's status, CI, a running process, a remote branch — for the STALE rule below to apply. |
+| `JEV_STALE_TURNS` | 3 | Such a claim blocks as `[STALE]` when the freshest tool-output line matching it is this many user turns old, or nothing matches at all. |
 
 **On `JEV_EVIDENCE_FLOOR`:** a calibrated judge like Jev tells you whether the evidence you gave
 it *supports* a claim — it isn't built to *derive* an unstated fact, like tracing exactly what a
@@ -144,6 +146,14 @@ reasoning and a worked example.
 4. Ask Jev whether the evidence supports, contradicts, or doesn't address each claim.
 5. Block the turn if anything is contradicted, or unsupported with no relevant evidence found at
    all (see the coverage note above).
+6. Separately, in step 2, ask whether each sentence asserts the *current state of something
+   outside the repo that changes on its own* — "the PR is still open", "the server is running",
+   "CI is green". If it does and the freshest tool output matching it is `JEV_STALE_TURNS` old
+   (or there is none), block it as `[STALE]` regardless of the judge's verdict: the fault is the
+   missing check, not the wording. This came from a real miss — three PRs described as "open,
+   waiting for merge" hours after the user had merged them, with nothing in the session having
+   checked; both judges let it through because an old `pull/36` URL from a `git push` counted as
+   on-topic evidence. On 1585 logged sentences the rule fires on that one and nothing else.
 
 ## Known limits
 

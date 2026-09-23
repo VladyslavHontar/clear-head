@@ -20,6 +20,10 @@ Env vars:
   JEV_EVIDENCE_FLOOR     coverage floor below which "not addressed" means nothing relevant was
                          found at all, vs. relevant evidence existing but not proving the claim
                          (default 0.3) — see the comment above EVIDENCE_FLOOR for why this exists
+  JEV_MUTABLE            how surely a sentence must read as a claim about mutable outside state
+                         (PR/CI/process/remote status) for the STALE rule to apply (default 0.6)
+  JEV_STALE_TURNS        such a claim blocks as STALE when its freshest matching evidence is this
+                         many user turns old, or there is none (default 3)
   VERIFIER_BACKEND       which judge answers: "jev" (default). Always an explicit choice, never a
                          silent fallback. Each backend reads its own <NAME>_FIRM (e.g. JEV_FIRM):
                          confidence scales differ between models, so one threshold can't be shared.
@@ -36,6 +40,8 @@ THRESH = float(os.environ.get("JEV_THRESH", 0.7))
 CONTRA = float(os.environ.get("JEV_CONTRA", 0.5))
 FACT = float(os.environ.get("JEV_FACT", 0.7))
 EVIDENCE_FLOOR = float(os.environ.get("JEV_EVIDENCE_FLOOR", 0.3))
+MUTABLE = float(os.environ.get("JEV_MUTABLE", 0.6))       # see the STALE rule in main()
+STALE_TURNS = int(os.environ.get("JEV_STALE_TURNS", 3))
 STOP = set("this that with from have does into only also than then they were been what when which their about there these those would could should".split())
 
 
@@ -170,8 +176,9 @@ def last_turn(path):
                         tool_desc[b["id"]] = desc[:60]
     cutoff = turn - MAX_TURNS_BACK
     lines = [l for t, l in all_lines if t >= cutoff]
+    ages = [turn - t for t, l in all_lines if t >= cutoff]  # how many user turns ago each line was produced
     reads = [r for t, r in all_reads if t >= cutoff]
-    return answer, lines, reads
+    return answer, lines, ages, reads
 
 
 def sentences(t):
@@ -188,10 +195,11 @@ def keywords(s):
     return {w for w in re.findall(r"[a-z][a-z0-9]{2,}|[^\W\da-z]{3,}|\d{2,}", s) if w not in STOP}
 
 
-def excerpt(claim, lines, kws, idf):
-    """Pick the tool-output lines most likely to bear on `claim`, and score how well the best
-    single line actually covers it (used later to decide whether an absence verdict means
-    "nothing relevant was read" vs. "relevant evidence exists but doesn't spell this out")."""
+def excerpt(claim, lines, kws, idf, ages):
+    """Pick the tool-output lines most likely to bear on `claim`; score how well the best single
+    line actually covers it (used later to decide whether an absence verdict means "nothing
+    relevant was read" vs. "relevant evidence exists but doesn't spell this out"); and report
+    how many turns old the freshest picked line is (None if nothing matched)."""
     kw = keywords(claim)
 
     def raw(n):  # unboosted overlap — used only to measure coverage, never to rank
@@ -207,11 +215,12 @@ def excerpt(claim, lines, kws, idf):
         return sum(idf[w] * (3 if w in lead else 1) for w in kw & kws[n])
 
     scored = sorted(((rank_score(n, l), n, l) for n, l in enumerate(lines)), reverse=True)
-    out, used = [], 0
+    out, used, fresh = [], 0, None
     for sc, n, l in scored[:LINES_PER_CLAIM]:
         if sc == 0 or used + len(l) > CHARS_PER_CLAIM:
             break
         out.append(l); used += len(l)
+        fresh = ages[n] if fresh is None else min(fresh, ages[n])
     # Coverage = the BEST SINGLE LINE's idf-weighted overlap with the claim (unboosted — the
     # position boost above is for ranking, not for this). A union across the whole excerpt is
     # easy to fool: several claim keywords can each appear somewhere, in unrelated lines, and
@@ -220,7 +229,7 @@ def excerpt(claim, lines, kws, idf):
     # signal; scattered partial matches across many lines are not.
     total_w = sum(idf.get(w, 0) for w in kw)
     coverage = max((raw(n) for _, n, _ in scored[:LINES_PER_CLAIM]), default=0.0) / total_w if total_w > 0 else 0.0
-    return out, coverage
+    return out, coverage, fresh
 
 
 def doc_lines(lines):
@@ -241,7 +250,7 @@ def main():
     inp = json.load(sys.stdin)
     if os.environ.get("JEV_HOOK", "on") == "off" or inp.get("stop_hook_active"):
         return
-    answer, lines, reads = last_turn(inp["transcript_path"])
+    answer, lines, ages, reads = last_turn(inp["transcript_path"])
     if not answer or not reads:
         return
     sents = sentences(answer)[:60]
@@ -256,10 +265,23 @@ def main():
                        "about_this_conversation": "describes what was done, found, built, or decided during this session, what the user should do next, or asserts that something was NOT done, tested, or verified (this session or in general) — there is no code to check a claim of absent action against",
                        "other": "general knowledge, meta commentary, headings, or list fragments"}}
           for i, s in enumerate(sents)}
+    # A separate axis, not a fifth category: "the PR is still open" is both a recap of this
+    # conversation AND a claim about the outside world, and a fifth mutually-exclusive label just
+    # split the probability mass (the one real case scored 0.47 as a fact, 0.96 on this noul).
+    q1.update({f"m{i}": {"type": "noul", "instructions":
+               "Does this sentence assert the CURRENT status of something outside the repository's files that "
+               "can change on its own between checks — a pull request or issue being open/merged/closed, a CI "
+               "or test run's result, a deployment, a running process or server, a remote branch, an external "
+               "service? (Not: how code is written, what was done in this conversation, proposals.)\n"
+               f"Sentence: {s}"} for i, s in enumerate(sents)})
     a1 = judge({"context": "Sentences from an AI assistant's answer about a software codebase. Classify each sentence "
                          "using the full answer for context: sentences inside a proposed design are proposals even if present tense.",
               "full_answer": answer[:12000]}, q1)
     fact_p = {i: a1[str(i)]["probabilities"].get("fact_about_existing_code", 0) for i in range(len(sents))}
+    # The noul reads "first, merge #36" as a status claim (0.94) — a proposal about mutable state
+    # isn't an assertion about it, so the choice's own verdict gates it.
+    mutable_p = {i: 0 if a1[str(i)].get("choice") == "proposal_or_opinion" else a1[f"m{i}"].get("noul", 0)
+                 for i in range(len(sents))}
     claims = list(enumerate(sents))  # verify every sentence, not just high-fact_p ones — a proposal can also be contradicted by the code
     if not claims:
         return
@@ -274,11 +296,11 @@ def main():
                      "claim against doc_comments + its excerpt + the reads list. not_addressed = nothing read bears on it.",
              "doc_comments": doc_lines(lines),
              "claims": {}}
-    coverage = {}
+    coverage, fresh = {}, {}
     for i, s in claims:
-        exc, cov = excerpt(s, lines, kws, idf)
+        exc, cov, fr = excerpt(s, lines, kws, idf, ages)
         state["claims"][f"c{i}"] = {"claim": s, "excerpt": exc}
-        coverage[i] = cov
+        coverage[i], fresh[i] = cov, fr
 
     # Criteria wording follows TypeSafe's citation-check cookbook; nested-path references in
     # `instructions` follow their state guidance (see https://docs.typesafe.ai).
@@ -305,6 +327,16 @@ def main():
     bad, soft = [], []
     for i, s in claims:
         r = a2[f"c{i}"]; p = r["probabilities"]
+        # A claim about mutable outside state ("the PR is still open", "the server is running")
+        # whose freshest matching evidence is STALE_TURNS old — or has none — was asserted from
+        # memory. Neither judge catches this: a stale URL or pid line reads as "on topic" (keyword
+        # coverage 0.62 on the case that prompted this) and the verdict lands on "not addressed"
+        # below every threshold. On 1585 logged sentences this fired exactly once, on that case;
+        # evidence age separated it from every claim verified the same turn (age 0). Independent
+        # of the judge's confidence on purpose: the fault is the missing check, not the verdict.
+        if mutable_p[i] >= MUTABLE and (fresh[i] is None or fresh[i] >= STALE_TURNS):
+            bad.append(("STALE", s))
+            continue
         if r.get("confidence", 1) < FIRM:
             continue  # a verdict the judge itself isn't confident in is for the log, not for blocking
         # coverage == 0: the excerpt shares not one keyword with the claim, so a "contradiction" is
@@ -331,13 +363,17 @@ def main():
                             "blocked": bool(bad), "fact_p": {s: round(fact_p[i], 2) for i, s in claims},
                             "coverage": {s: round(coverage[i], 2) for i, s in claims}, "soft": len(soft),
                             "verdicts": {s: a2[f"c{i}"]["probabilities"] for i, s in claims},
-                            "confidence": {s: a2[f"c{i}"].get("confidence") for i, s in claims}}) + "\n")
+                            "confidence": {s: a2[f"c{i}"].get("confidence") for i, s in claims},
+                            "mutable": {s: round(mutable_p[i], 2) for i, s in claims},
+                            "fresh": {s: fresh[i] for i, s in claims}}) + "\n")
 
     if bad:
         print(json.dumps({"decision": "block", "reason":
             "Jev claim check: these statements about the codebase are contradicted by, or absent from, "
             "what you read this session. Verify each with a read/grep, or rewrite it as an explicit "
-            "assumption, then finish.\n" + "\n".join(f"- [{k}] {s}" for k, s in bad)}))
+            "assumption, then finish. STALE = it asserts the current state of something outside the repo "
+            "(a PR, CI, a process, a remote) and nothing checked it in the last few turns — run the status "
+            "command now rather than restating it from memory.\n" + "\n".join(f"- [{k}] {s}" for k, s in bad)}))
 
 
 if __name__ == "__main__":
