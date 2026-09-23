@@ -20,6 +20,9 @@ Env vars:
   JEV_EVIDENCE_FLOOR     coverage floor below which "not addressed" means nothing relevant was
                          found at all, vs. relevant evidence existing but not proving the claim
                          (default 0.3) — see the comment above EVIDENCE_FLOOR for why this exists
+  VERIFIER_BACKEND       which judge answers: "jev" (default). Always an explicit choice, never a
+                         silent fallback. Each backend reads its own <NAME>_FIRM (e.g. JEV_FIRM):
+                         confidence scales differ between models, so one threshold can't be shared.
 """
 import json, os, re, sys, urllib.request, urllib.error, time, pathlib, math, collections
 
@@ -32,21 +35,30 @@ LINES_PER_CLAIM, CHARS_PER_CLAIM, LINE_CAP, DOC_CHARS = 12, 1200, 160, 3000
 THRESH = float(os.environ.get("JEV_THRESH", 0.7))
 CONTRA = float(os.environ.get("JEV_CONTRA", 0.5))
 FACT = float(os.environ.get("JEV_FACT", 0.7))
-FIRM = float(os.environ.get("JEV_FIRM", 0.6))
 EVIDENCE_FLOOR = float(os.environ.get("JEV_EVIDENCE_FLOOR", 0.3))
 STOP = set("this that with from have does into only also than then they were been what when which their about there these those would could should".split())
 
 
-def key():
-    env = os.environ.get("TYPESAFE_API_KEY", "")
+def _config(var, default=""):
+    env = os.environ.get(var, "")
     if env:
         return env
     envfile = HERE / ".env"
     if envfile.exists():
         for line in envfile.read_text().splitlines():
-            if line.startswith("TYPESAFE_API_KEY="):
+            if line.startswith(var + "="):
                 return line.split("=", 1)[1].strip()
-    return ""
+    return default
+
+
+def key():
+    return _config("TYPESAFE_API_KEY")
+
+
+# Read the same way as the key (env, then .env) so an installer can persist the choice — a shell
+# `export` may not reach a hook launched from a Claude Code session started elsewhere.
+VERIFIER_BACKEND = _config("VERIFIER_BACKEND", "jev")
+FIRM = float(os.environ.get(f"{VERIFIER_BACKEND.upper()}_FIRM", 0.6))
 
 
 def jev(state, questions):
@@ -69,6 +81,17 @@ def jev(state, questions):
         if e.code == 403 and "reads_this_session" in state:
             return post({**state, "reads_this_session": "(omitted: the API's firewall rejected the command list)"})
         raise
+
+
+BACKENDS = {"jev": jev}
+
+
+def judge(state, questions):
+    """Single dispatch point: a new backend is one function with jev()'s signature and one entry
+    in BACKENDS, not if/else scattered through main(). Unknown names fail loudly on purpose."""
+    if VERIFIER_BACKEND not in BACKENDS:
+        raise SystemExit(f"VERIFIER_BACKEND={VERIFIER_BACKEND!r} is not one of {sorted(BACKENDS)}")
+    return BACKENDS[VERIFIER_BACKEND](state, questions)
 
 
 def text_of(c):
@@ -204,7 +227,7 @@ def main():
                        "about_this_conversation": "describes what was done, found, built, or decided during this session, what the user should do next, or asserts that something was NOT done, tested, or verified (this session or in general) — there is no code to check a claim of absent action against",
                        "other": "general knowledge, meta commentary, headings, or list fragments"}}
           for i, s in enumerate(sents)}
-    a1 = jev({"context": "Sentences from an AI assistant's answer about a software codebase. Classify each sentence "
+    a1 = judge({"context": "Sentences from an AI assistant's answer about a software codebase. Classify each sentence "
                          "using the full answer for context: sentences inside a proposed design are proposals even if present tense.",
               "full_answer": answer[:12000]}, q1)
     fact_p = {i: a1[str(i)]["probabilities"].get("fact_about_existing_code", 0) for i in range(len(sents))}
@@ -239,7 +262,7 @@ def main():
 
     with open(SENT, "a") as f:
         f.write(json.dumps({"ts": time.time(), "session": inp.get("session_id"), "state": state}) + "\n")
-    a2 = jev(state, q2)
+    a2 = judge(state, q2)
 
     bad, soft = [], []
     for i, s in claims:
@@ -262,10 +285,12 @@ def main():
                 soft.append(("low-coverage, not blocked", s, coverage[i]))
 
     with open(LOG, "a") as f:
-        f.write(json.dumps({"ts": time.time(), "session": inp.get("session_id"), "n_sent": len(sents), "n_claims": len(claims),
+        f.write(json.dumps({"ts": time.time(), "session": inp.get("session_id"), "backend": VERIFIER_BACKEND,
+                            "n_sent": len(sents), "n_claims": len(claims),
                             "blocked": bool(bad), "fact_p": {s: round(fact_p[i], 2) for i, s in claims},
                             "coverage": {s: round(coverage[i], 2) for i, s in claims}, "soft": len(soft),
-                            "verdicts": {s: a2[f"c{i}"]["probabilities"] for i, s in claims}}) + "\n")
+                            "verdicts": {s: a2[f"c{i}"]["probabilities"] for i, s in claims},
+                            "confidence": {s: a2[f"c{i}"].get("confidence") for i, s in claims}}) + "\n")
 
     if bad:
         print(json.dumps({"decision": "block", "reason":
