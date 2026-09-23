@@ -109,6 +109,76 @@ class Verdicts(unittest.TestCase):
         self.assertIn("[UNSUPPORTED] " + c1, r["reason"])
 
 
+FACT_CLAIM = "The scheduler retries failed jobs three times before giving up on them."
+
+
+class Sources(unittest.TestCase):
+    def test_claim_backed_only_by_subagent_report_blocks_as_relayed(self):
+        report = ("Another Claude session sent a message:\n<agent-message from=\"abc123\">\n[Subagent hand-back] The report follows:\n"
+                  "  The scheduler retries failed jobs three times before giving up, see scheduler.rs:40\n</agent-message>")
+        turns = [("look", [("ls", "README.md")], None), (report, [], FACT_CLAIM + " " + PADDING)]
+        r = run_hook(transcript(turns), fake_judge(pass1={FACT_CLAIM: ("fact_about_existing_code", 0.0)}, pass2={FACT_CLAIM: (0.9, 0.05, 0.05, 0.9)}))
+        self.assertIn("[RELAYED] " + FACT_CLAIM, r["reason"])
+
+    def test_same_claim_backed_by_a_read_passes(self):
+        turns = [("look", [("grep retries scheduler.rs", "scheduler.rs:40: retries failed jobs three times before giving up")], FACT_CLAIM + " " + PADDING)]
+        r = run_hook(transcript(turns), fake_judge(pass1={FACT_CLAIM: ("fact_about_existing_code", 0.0)}, pass2={FACT_CLAIM: (0.9, 0.05, 0.05, 0.9)}))
+        self.assertIsNone(r)
+
+    def test_subagent_report_does_not_count_as_a_user_turn(self):
+        report = "Another Claude session sent a message:\n<agent-message from=\"abc123\">\n[Subagent hand-back] The report follows:\n  hello\n</agent-message>"
+        path = transcript([("look", [("ls", "a.txt")], None), (report, [], None), ("next", [], "Done. " + PADDING)])
+        _, lines, ages, _ = s.last_turn(path)
+        self.assertEqual([a for l, a in zip(lines, ages) if l.startswith("[ls]")], [1])  # one user turn later, not two
+        self.assertTrue(any(l.startswith("[agent:abc123]") for l in lines))
+
+    def test_number_absent_from_all_evidence_is_unsupported(self):
+        c = "The full workspace run finished with 575 passed and 0 failed across every crate."
+        turns = [("run", [("cargo test -p lumen", "test result: ok. 17 passed; 0 failed")], c + " " + PADDING)]
+        r = run_hook(transcript(turns), fake_judge(pass1={c: ("fact_about_existing_code", 0.0)}, pass2={c: (0.1, 0.05, 0.85, 0.9)}))
+        self.assertIn("[UNSUPPORTED] " + c, r["reason"])
+
+    def test_number_present_in_evidence_or_user_prompt_is_fine(self):
+        c = "The full workspace run finished with 1 738 passed and 0 failed across every crate."
+        turns = [("we had 1738 tests last time", [("cargo test", "test result: ok. 17 passed; 0 failed")], c + " " + PADDING)]
+        r = run_hook(transcript(turns), fake_judge(pass1={c: ("fact_about_existing_code", 0.0)}, pass2={c: (0.1, 0.05, 0.85, 0.9)}))
+        self.assertIsNone(r)
+
+    def test_number_rule_does_not_disable_contradicted(self):
+        c = "The server binds to every interface on port 8787 by default."
+        turns = [("check", [("grep HOST laya_server.py", "HOST = 127.0.0.1  # server binds port")], c + " " + PADDING)]
+        r = run_hook(transcript(turns), fake_judge(pass2={c: (0.05, 0.9, 0.05, 0.9)}))
+        self.assertIn("[CONTRADICTED] " + c, r["reason"])
+
+    def test_claim_that_admits_memory_blocks(self):
+        c = "По памяти, планировщик повторяет упавшие задания три раза перед тем, как сдаться."
+        ok = "Не по памяти: планировщик повторяет упавшие задания три раза, сверено с scheduler.rs."
+        turns = [("look", [("grep retries scheduler.rs", "scheduler.rs:40: retries failed jobs three times")], f"{c} {ok} " + PADDING)]
+        r = run_hook(transcript(turns), fake_judge(pass1={c: ("fact_about_existing_code", 0.0), ok: ("fact_about_existing_code", 0.0)},
+                                                   pass2={c: (0.9, 0.05, 0.05, 0.9), ok: (0.9, 0.05, 0.05, 0.9)}))
+        self.assertIn("[UNVERIFIED] " + c, r["reason"]); self.assertNotIn(ok, r["reason"])
+
+    def test_fenced_lines_with_digits_become_sentences(self):
+        got = s.sentences("Result:\n```\ntest result: ok. 575 passed; 0 failed; finished in 2.1s\nrunning 3 tests\n$ cargo test\n```\nAll good and the build is clean now.")
+        self.assertTrue(any("575 passed" in x for x in got)); self.assertFalse(any("cargo test" in x for x in got))
+
+    def test_numbers_normalise(self):
+        self.assertEqual(s.numbers("1 738 tests, 2,5 slots, v4, line 224"), {"1738", "2.5", "224"})
+
+
+class Batching(unittest.TestCase):
+    def test_pass2_is_chunked_for_batched_backends(self):
+        answer = " ".join(f"Claim number {i} says the module handles case {i} correctly today." for i in range(s.CHUNK + 5))
+        turns = [("go", [("ls", "README.md")], answer)]
+        inner = fake_judge(); calls = []
+        def judge(state, q):
+            calls.append(len(q)); return inner(state, q)
+        with mock.patch.object(s, "PER_CLAIM", set()):
+            run_hook(transcript(turns), judge)
+        pass2 = [n for n in calls[2:]]  # calls 0 and 1 are pass-1 choice + mutable noul
+        self.assertEqual(len(pass2), 2); self.assertEqual(pass2[0], s.CHUNK); self.assertEqual(sum(pass2), s.CHUNK + 5)
+
+
 class Retrieval(unittest.TestCase):
     def test_excerpt_reports_freshest_line_age(self):
         lines = ["[a] alpha beta", "[b] alpha gamma", "[c] delta"]

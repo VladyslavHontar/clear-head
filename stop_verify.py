@@ -35,6 +35,7 @@ HERE = pathlib.Path(__file__).parent
 LOG, SENT = HERE / "log.jsonl", HERE / "sent.jsonl"
 API = "https://api.typesafe.ai/v1/systemone"
 LINES_PER_CLAIM, CHARS_PER_CLAIM, LINE_CAP, DOC_CHARS = 12, 1200, 160, 3000
+CHUNK, READS_CAP = 25, 120  # claims per batched request; commands listed per request (see main)
 # hand-tuned starting points — every project's evidence shape differs, so these are meant to be
 # overridden via env vars once you have a few dozen logged verdicts to tune against (see README)
 THRESH = float(os.environ.get("JEV_THRESH", 0.7))
@@ -171,7 +172,20 @@ def last_turn(path):
                         src = tool_desc.get(b.get("tool_use_id"), "")
                         tag = f"[{src}] " if src else ""
                         all_lines += [(turn, (tag + l.strip())[:LINE_CAP]) for l in text_of(b.get("content") or "").splitlines() if l.strip()]
+            elif isinstance(c, str) and c.startswith("Another Claude session sent a message"):
+                # A subagent's report comes back as a user-role row, not a tool_result. It was
+                # invisible here, so a claim relayed from it had no evidence at all and passed or
+                # failed by luck; and it bumped the turn counter as if the user had spoken. Keep it
+                # as evidence tagged [agent:...] — main() treats "only agent lines" as unverified.
+                src = re.search(r'<agent-message from="([^"]+)"', c)
+                tag = f"[agent:{src.group(1)[:8] if src else '?'}] "
+                all_lines += [(turn, (tag + l.strip())[:LINE_CAP]) for l in c.splitlines()
+                              if l.strip() and not l.lstrip().startswith("<") and "Subagent hand-back" not in l
+                              and not l.startswith("Another Claude session")]
             elif text_of(c or "").strip():
+                # the user's own words are evidence too: a number the assistant repeats from the
+                # prompt isn't an unsourced number
+                all_lines += [(turn + 1, ("[user] " + l.strip())[:LINE_CAP]) for l in text_of(c).splitlines() if l.strip()]
                 answer = ""; turn += 1
         elif d.get("type") == "assistant":
             for b in m.get("content", []):
@@ -191,9 +205,14 @@ def last_turn(path):
 
 
 def sentences(t):
+    # Fenced blocks are where run results get quoted ("test result: ok. 575 passed; 0 failed") —
+    # dropping them whole hid exactly the numbers most worth sourcing. Their digit-bearing lines
+    # are kept whole, not sentence-split: "ok." would otherwise cut the count off.
+    fenced = [l.strip() for m in re.finditer(r"```.*?```", t, flags=re.S) for l in m.group(0).splitlines()
+              if re.search(r"\d", l) and not l.startswith("```") and len(l.strip()) > 20]
     t = re.sub(r"```.*?```", " ", t, flags=re.S)
     t = re.sub(r"[#*_`|]", " ", t)
-    return [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", t) if len(s.strip()) > 40]
+    return [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", t) if len(s.strip()) > 40] + fenced
 
 
 def keywords(s):
@@ -202,6 +221,12 @@ def keywords(s):
     # a claim written in a non-Latin language previously got ZERO keywords and so zero coverage, always
     # below EVIDENCE_FLOOR, always blockable regardless of truth | bare numbers
     return {w for w in re.findall(r"[a-z][a-z0-9]{2,}|[^\W\da-z]{3,}|\d{2,}", s) if w not in STOP}
+
+
+def numbers(t):
+    """Numbers of 2+ digits, normalised so "1 738", "1738" and "2,5"/"2.5" compare equal."""
+    return {re.sub(r"[  ]", "", n).replace(",", ".") for n in re.findall(r"\d+(?:[  ]\d{3})*(?:[.,]\d+)?", t)
+            if len(re.sub(r"\D", "", n)) >= 2}
 
 
 def excerpt(claim, lines, kws, idf, ages):
@@ -265,6 +290,9 @@ def main():
     sents = sentences(answer)[:60]
     if not sents:
         return
+    with open(LOG, "a") as f:  # a start row: a run the harness kills (timeout) then leaves a visible gap
+        f.write(json.dumps({"ts": time.time(), "session": inp.get("session_id"), "backend": VERIFIER_BACKEND,
+                            "event": "start", "n_sent": len(sents), "n_lines": len(lines)}) + "\n")
 
     # Pass 1: which sentences are factual claims about the existing system, as opposed to
     # proposals, opinions, or a recap of the conversation itself?
@@ -309,17 +337,25 @@ def main():
     # contradiction against that one line could never block
     idf = {w: math.log((1 + len(lines)) / (1 + c)) + 1e-6 for w, c in df.items()}
 
-    state = {"reads_this_session": reads,
+    state = {"reads_this_session": reads[-READS_CAP:],
              "note": "doc_comments = module/item doc comments from files read this session (design invariants). "
                      "Each claim has its own excerpt: tool-output lines sharing rare keywords with it. Judge each "
                      "claim against doc_comments + its excerpt + the reads list. not_addressed = nothing read bears on it.",
              "doc_comments": doc_lines(lines),
              "claims": {}}
-    coverage, fresh = {}, {}
+    coverage, fresh, relayed, unsourced = {}, {}, {}, {}
+    evidence_numbers = numbers("\n".join(lines))
     for i, s in claims:
         exc, cov, fr = excerpt(s, lines, kws, idf, ages)
         state["claims"][f"c{i}"] = {"claim": s, "excerpt": exc}
         coverage[i], fresh[i] = cov, fr
+        # every matching line came from a subagent's report: the assistant is repeating, not checking
+        relayed[i] = bool(exc) and all(l.startswith("[agent:") for l in exc)
+        # a number in the claim that no tool output (or user message) in the window contains — a
+        # test count, a percentage, a line number stated with nothing to point at. The keyword
+        # retriever can't see this ("11 тестов, clippy 0" matched a neighbouring line at coverage
+        # 0.73); the UNSUPPORTED path treats it as "nothing relevant found".
+        unsourced[i] = sorted(numbers(s) - evidence_numbers)
 
     # Criteria wording follows TypeSafe's citation-check cookbook; nested-path references in
     # `instructions` follow their state guidance (see https://docs.typesafe.ai).
@@ -341,7 +377,12 @@ def main():
         q2 = {f"c{i}": {"type": "choice", "criteria": criteria,
               "instructions": f"How do `doc_comments`, `claims.c{i}.excerpt` and `reads_this_session` relate to the claim `claims.c{i}.claim`?"}
               for i, s in claims}
-        a2 = judge(state, q2)
+        # in chunks: a 43-claim recon answer made a 120 KB request, the API answered 400, and the
+        # hook failed open on the one answer of the day that most needed checking
+        a2 = {}
+        for start in range(0, len(claims), CHUNK):
+            part = [f"c{i}" for i, _ in claims[start:start + CHUNK]]
+            a2.update(judge({**state, "claims": {k: state["claims"][k] for k in part}}, {k: q2[k] for k in part}))
 
     bad, soft = [], []
     for i, s in claims:
@@ -355,6 +396,18 @@ def main():
         # of the judge's confidence on purpose: the fault is the missing check, not the verdict.
         if mutable_p[i] >= MUTABLE and (fresh[i] is None or fresh[i] >= STALE_TURNS):
             bad.append(("STALE", s))
+            continue
+        # The assistant saying so itself is the cheapest signal there is: "по памяти" / "from
+        # memory" / "не проверял" in a claim about the code means it wasn't checked, whatever the
+        # judge thinks of the excerpt. "не по памяти" is the opposite and is left alone.
+        if fact_p[i] >= FACT and re.search(r"(?<!не )по памяти|from memory|не проверял|не измерял|haven't (?:checked|verified)", s, re.I):
+            bad.append(("UNVERIFIED", s))
+            continue
+        # A factual claim whose only matching evidence is a subagent's report: the report is
+        # model output, not a read. Line ranges relayed this way were wrong on the same day
+        # (blockstore.rs:147-187 → actual 148 / 171-186); the reader has to look itself.
+        if fact_p[i] >= FACT and relayed[i]:
+            bad.append(("RELAYED", s))
             continue
         if r.get("confidence", 1) < FIRM:
             continue  # a verdict the judge itself isn't confident in is for the log, not for blocking
@@ -371,7 +424,7 @@ def main():
             # that's usually this limit, not a real gap, so it shouldn't block. Low coverage means
             # nothing relevant was read at all, which is the actual "unverified claim" this hook
             # exists to catch.
-            if coverage[i] < EVIDENCE_FLOOR:
+            if coverage[i] < EVIDENCE_FLOOR or unsourced[i]:
                 bad.append(("UNSUPPORTED", s))
             else:
                 soft.append(("low-coverage, not blocked", s, coverage[i]))
@@ -384,7 +437,9 @@ def main():
                             "verdicts": {s: a2[f"c{i}"]["probabilities"] for i, s in claims},
                             "confidence": {s: a2[f"c{i}"].get("confidence") for i, s in claims},
                             "mutable": {s: round(mutable_p[i], 2) for i, s in claims},
-                            "fresh": {s: fresh[i] for i, s in claims}}) + "\n")
+                            "fresh": {s: fresh[i] for i, s in claims},
+                            "relayed": [s for i, s in claims if relayed[i]],
+                            "unsourced": {s: unsourced[i] for i, s in claims if unsourced[i]}}) + "\n")
 
     if bad:
         print(json.dumps({"decision": "block", "reason":
@@ -392,7 +447,10 @@ def main():
             "what you read this session. Verify each with a read/grep, or rewrite it as an explicit "
             "assumption, then finish. STALE = it asserts the current state of something outside the repo "
             "(a PR, CI, a process, a remote) and nothing checked it in the last few turns — run the status "
-            "command now rather than restating it from memory.\n" + "\n".join(f"- [{k}] {s}" for k, s in bad)}))
+            "command now rather than restating it from memory. RELAYED = its only evidence is a subagent's "
+            "report — read the file or run the command yourself. UNVERIFIED = the sentence itself says it "
+            "wasn't checked. A number no tool output contains counts as unsupported.\n"
+            + "\n".join(f"- [{k}] {s}" for k, s in bad)}))
 
 
 if __name__ == "__main__":

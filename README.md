@@ -154,6 +154,17 @@ reasoning and a worked example.
    waiting for merge" hours after the user had merged them, with nothing in the session having
    checked; both judges let it through because an old `pull/36` URL from a `git push` counted as
    on-topic evidence. On 1585 logged sentences the rule fires on that one and nothing else.
+7. Three more checks that need no judge, each from a miss found by auditing real sessions:
+   - `[RELAYED]` — a factual claim whose only matching evidence is a **subagent's report**. Those
+     reports arrive as a message, not a tool result, so the hook used to not see them at all and a
+     relayed line range (`blockstore.rs:147-187`, actually `148` / `171-186`) passed on luck. Now
+     they're evidence tagged `[agent:…]`, and a claim resting on nothing else is sent back to read
+     the file itself.
+   - A **number** in a claim that no tool output or user message in the window contains — a test
+     count, a percentage, a line number — counts as unsupported: `575 passed` when the only runs
+     printed 17, 23, 71 and 21. Lines with digits inside fenced code are checked too; they used to
+     be dropped with the fence.
+   - `[UNVERIFIED]` — the sentence says so itself: "по памяти", "from memory", "не проверял".
 
 ## Known limits
 
@@ -172,6 +183,10 @@ reasoning and a worked example.
   of the current version — but it's still exact-word matching, not semantic, so it still misses a
   claim phrased differently from its supporting evidence, in any language.
 - It's excerpts, not full files — see "What it sends" above.
+- The turn that answers a block is exempt (`stop_hook_active`, Claude Code's loop guard), so a
+  correction that introduces a *new* unverified claim isn't checked. Known, not yet addressed.
+- Evidence age is counted in user turns, so a claim about state changed *within* the turn — "PR
+  updated" stated after a `git push` that ran *before* the commit it refers to — still looks fresh.
 - TypeSafe's API sits behind a Cloudflare firewall that rejects request bodies which look like
   command injection — and a coding session's list of commands run (`curl -H ...`, `cat /sys/...`,
   heredocs) trips it reliably. On that 403 the hook retries once without the command list, so the
