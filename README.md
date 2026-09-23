@@ -112,7 +112,7 @@ documentation-first project will all need different thresholds. Start with the d
 |---|---|---|
 | `JEV_CONTRA` | 0.5 | Contradiction probability that triggers a block. Lower = stricter. |
 | `JEV_THRESH` | 0.7 | "Not addressed" probability that counts as unsupported. |
-| `JEV_FACT` | 0.7 | How confidently a sentence must read as a factual claim to be checked at all. |
+| `JEV_FACT` | 0.7 | How confidently a sentence must read as a factual claim to be checked at all. Per backend like `FIRM`: `KEV_FACT` defaults to 0.6, because Kev scores the same real facts 0.66–0.77 where Jev scores them 0.79–1.00. |
 | `JEV_FIRM` | 0.6 | Minimum confidence in Jev's own verdict before acting on it. Below this, it's logged but never blocks. |
 | `JEV_EVIDENCE_FLOOR` | 0.3 | See below. |
 | `JEV_MAX_TURNS_BACK` | 20 | How many user turns of evidence to keep. Lower = less stale-evidence noise in a long session, but a recap further back than this stops being checkable. |
@@ -120,7 +120,7 @@ documentation-first project will all need different thresholds. Start with the d
 | `VERIFIER_BACKEND` | `jev` | `jev` (TypeSafe's API) or `kev` (local). Always explicit — an unknown name fails loudly rather than falling back. Persisted in `.env` by `install.sh --kev`. |
 | `KEV_FIRM` | 0.5 | `JEV_FIRM` for the Kev backend — separate because the two models' confidence scales differ. 0.5 is where Kev's "contradicted" verdicts agreed with Jev most often on 1309 replayed claims (47%, vs 27% at 0.15). |
 | `KEV_PORT` | 8009 | Where `kev.serve` listens (always on 127.0.0.1). |
-| `JEV_MUTABLE` | 0.6 | How surely a sentence must read as a claim about *mutable outside state* — a PR or issue's status, CI, a running process, a remote branch — for the STALE rule below to apply. |
+| `JEV_MUTABLE` | 0.7 | How surely a sentence must read as a claim about *mutable outside state* — a PR or issue's status, CI, a running process, a remote branch — for the STALE rule below to apply. |
 | `JEV_STALE_TURNS` | 3 | Such a claim blocks as `[STALE]` when the freshest tool-output line matching it is this many user turns old, or nothing matches at all. |
 
 **On `JEV_EVIDENCE_FLOOR`:** a calibrated judge like Jev tells you whether the evidence you gave

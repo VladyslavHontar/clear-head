@@ -15,13 +15,14 @@ Env vars:
   JEV_HOOK=off           disable for this shell (useful for an A/B comparison, or sensitive work)
   JEV_THRESH             not-addressed threshold to flag a claim as unsupported (default 0.7)
   JEV_CONTRA             contradiction threshold to block (default 0.5)
-  JEV_FACT               how confidently a sentence must read as a factual claim to be checked (default 0.7)
+  JEV_FACT               how confidently a sentence must read as a factual claim to be checked (default 0.7;
+                         per backend like FIRM — KEV_FACT defaults to 0.6, see FACT_DEFAULT)
   JEV_FIRM               minimum Jev confidence in its own verdict to act on it (default 0.6)
   JEV_EVIDENCE_FLOOR     coverage floor below which "not addressed" means nothing relevant was
                          found at all, vs. relevant evidence existing but not proving the claim
                          (default 0.3) — see the comment above EVIDENCE_FLOOR for why this exists
   JEV_MUTABLE            how surely a sentence must read as a claim about mutable outside state
-                         (PR/CI/process/remote status) for the STALE rule to apply (default 0.6)
+                         (PR/CI/process/remote status) for the STALE rule to apply (default 0.7)
   JEV_STALE_TURNS        such a claim blocks as STALE when its freshest matching evidence is this
                          many user turns old, or there is none (default 3)
   VERIFIER_BACKEND       which judge answers: "jev" (default). Always an explicit choice, never a
@@ -38,9 +39,11 @@ LINES_PER_CLAIM, CHARS_PER_CLAIM, LINE_CAP, DOC_CHARS = 12, 1200, 160, 3000
 # overridden via env vars once you have a few dozen logged verdicts to tune against (see README)
 THRESH = float(os.environ.get("JEV_THRESH", 0.7))
 CONTRA = float(os.environ.get("JEV_CONTRA", 0.5))
-FACT = float(os.environ.get("JEV_FACT", 0.7))
 EVIDENCE_FLOOR = float(os.environ.get("JEV_EVIDENCE_FLOOR", 0.3))
-MUTABLE = float(os.environ.get("JEV_MUTABLE", 0.6))       # see the STALE rule in main()
+# 0.7, not 0.6: a day of live use blocked "everything is pushed (#7, #4)" at 0.60 and "the tests
+# are done and found three bugs" at 0.69 — completed actions, not state that changes on its own.
+# The real case scored 0.96-0.98; nothing between 0.6 and 0.7 in 1585 logged sentences was one.
+MUTABLE = float(os.environ.get("JEV_MUTABLE", 0.7))       # see the STALE rule in main()
 STALE_TURNS = int(os.environ.get("JEV_STALE_TURNS", 3))
 STOP = set("this that with from have does into only also than then they were been what when which their about there these those would could should".split())
 
@@ -119,6 +122,10 @@ PER_CLAIM = {"kev"}
 # equally often, so this is where its signal is, not proof it's right.
 FIRM_DEFAULT = {"jev": 0.6, "kev": 0.5}
 FIRM = float(os.environ.get(f"{VERIFIER_BACKEND.upper()}_FIRM", FIRM_DEFAULT.get(VERIFIER_BACKEND, 0.6)))
+# Same for the "is this a factual claim" gate: on the same sentences Kev puts real facts at
+# 0.66-0.77 where Jev puts them at 0.79-1.00, and opinions at 0.20-0.36 vs Jev's 0.01-0.63.
+FACT_DEFAULT = {"jev": 0.7, "kev": 0.6}
+FACT = float(os.environ.get(f"{VERIFIER_BACKEND.upper()}_FACT", FACT_DEFAULT.get(VERIFIER_BACKEND, 0.7)))
 
 
 def judge(state, questions):
@@ -263,26 +270,33 @@ def main():
     # proposals, opinions, or a recap of the conversation itself?
     q1 = {str(i): {"type": "choice", "instructions": f"Sentence: {s}",
           "criteria": {"fact_about_existing_code": "asserts how the code/system currently is or behaves (present tense, checkable in the repo)",
-                       "proposal_or_opinion": "recommends, proposes, predicts, or describes a design that does not exist yet",
+                       # "or interprets": a day on Kev blocked "we're bottlenecked on scheduling, not the build"
+                       # and "this cements the trap the bench fell into" as unverifiable facts. Naming
+                       # interpretation here drops them (Jev 0.78 → 0.29, 0.38 → 0.01) while real facts hold.
+                       "proposal_or_opinion": "recommends, proposes, predicts, or describes a design that does not exist yet; "
+                                              "or interprets — a diagnosis of why something behaves as it does, a bottleneck claim, "
+                                              "a conclusion drawn from results, a characterization",
                        "about_this_conversation": "describes what was done, found, built, or decided during this session, what the user should do next, or asserts that something was NOT done, tested, or verified (this session or in general) — there is no code to check a claim of absent action against",
                        "other": "general knowledge, meta commentary, headings, or list fragments"}}
           for i, s in enumerate(sents)}
     # A separate axis, not a fifth category: "the PR is still open" is both a recap of this
     # conversation AND a claim about the outside world, and a fifth mutually-exclusive label just
     # split the probability mass (the one real case scored 0.47 as a fact, 0.96 on this noul).
-    q1.update({f"m{i}": {"type": "noul", "instructions":
-               "Does this sentence assert the CURRENT status of something outside the repository's files that "
-               "can change on its own between checks — a pull request or issue being open/merged/closed, a CI "
-               "or test run's result, a deployment, a running process or server, a remote branch, an external "
-               "service? (Not: how code is written, what was done in this conversation, proposals.)\n"
-               f"Sentence: {s}"} for i, s in enumerate(sents)})
     a1 = judge({"context": "Sentences from an AI assistant's answer about a software codebase. Classify each sentence "
                          "using the full answer for context: sentences inside a proposed design are proposals even if present tense.",
               "full_answer": answer[:12000]}, q1)
     fact_p = {i: a1[str(i)]["probabilities"].get("fact_about_existing_code", 0) for i in range(len(sents))}
-    # The noul reads "first, merge #36" as a status claim (0.94) — a proposal about mutable state
-    # isn't an assertion about it, so the choice's own verdict gates it.
-    mutable_p = {i: 0 if a1[str(i)].get("choice") == "proposal_or_opinion" else a1[f"m{i}"].get("noul", 0)
+    # Its own call, WITHOUT the full answer: whether a sentence asserts outside state is a property
+    # of the sentence, and the answer as context made Kev read "first, merge #36" (a next step) as
+    # a status claim at 0.94 — with the sentence alone it is 0.24, while the real case stays 0.92+.
+    qm = {f"m{i}": {"type": "noul", "instructions":
+          "Does this sentence assert the CURRENT status of something outside the repository's files that "
+          "can change on its own between checks — a pull request or issue being open/merged/closed, a CI "
+          "or test run's result, a deployment, a running process or server, a remote branch, an external "
+          "service? (Not: how code is written, what was done in this conversation, proposals.)\n"
+          f"Sentence: {s}"} for i, s in enumerate(sents)}
+    am = judge({"context": "Sentences from an AI assistant's answer about a software codebase."}, qm)
+    mutable_p = {i: 0 if a1[str(i)]["probabilities"].get("proposal_or_opinion", 0) >= 0.3 else am[f"m{i}"].get("noul", 0)
                  for i in range(len(sents))}
     claims = list(enumerate(sents))  # verify every sentence, not just high-fact_p ones — a proposal can also be contradicted by the code
     if not claims:
