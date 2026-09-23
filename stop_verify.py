@@ -82,7 +82,7 @@ def jev(state, questions):
         raise
 
 
-KEV_URL = f"http://127.0.0.1:{os.environ.get('KEV_PORT', '8009')}/v1/systemone"
+KEV_URL = f"http://127.0.0.1:{_config('KEV_PORT', '8009')}/v1/systemone"  # env, then .env — like the key
 
 
 def kev(state, questions):

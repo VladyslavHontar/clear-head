@@ -41,6 +41,11 @@ if [ "$BACKEND" = "kev" ]; then
   grep -q '^VERIFIER_BACKEND=' "$TARGET_DIR/.env" 2>/dev/null \
     && sed -i.bak '/^VERIFIER_BACKEND=/d' "$TARGET_DIR/.env" && rm -f "$TARGET_DIR/.env.bak"
   printf 'VERIFIER_BACKEND=kev\n' >> "$TARGET_DIR/.env"
+  if [ "$KEV_PORT" != 8009 ]; then
+    grep -q '^KEV_PORT=' "$TARGET_DIR/.env" 2>/dev/null \
+      && sed -i.bak '/^KEV_PORT=/d' "$TARGET_DIR/.env" && rm -f "$TARGET_DIR/.env.bak"
+    printf 'KEV_PORT=%s\n' "$KEV_PORT" >> "$TARGET_DIR/.env"
+  fi
 
   cp "$SCRIPT_DIR/kev_serve.sh" "$TARGET_DIR/kev_serve.sh"; chmod +x "$TARGET_DIR/kev_serve.sh"
   [ -d "$TARGET_DIR/kev" ] || git clone -q --depth 1 https://github.com/jaredpalmer/kev "$TARGET_DIR/kev"
