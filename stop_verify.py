@@ -145,7 +145,9 @@ def last_turn(path):
     in a long, multi-topic session lets a new claim match stale evidence from an unrelated earlier
     part of the conversation on generic keyword overlap alone — see README Known limits."""
     answer, all_lines, all_reads, turn, tool_desc = "", [], [], 0, {}
-    for raw in open(path):
+    with open(path) as f:
+        rows = f.readlines()
+    for raw in rows:
         try:
             d = json.loads(raw)
         except Exception:
@@ -288,7 +290,10 @@ def main():
 
     kws = [keywords(l) for l in lines]
     df = collections.Counter(w for k in kws for w in k)
-    idf = {w: math.log(len(lines) / (1 + c)) for w, c in df.items()}
+    # smoothed so no weight is ever <= 0: with plain log(N/(1+df)) a word present in every line
+    # went negative — and with a single evidence line every word did, so coverage was 0 and a
+    # contradiction against that one line could never block
+    idf = {w: math.log((1 + len(lines)) / (1 + c)) + 1e-6 for w, c in df.items()}
 
     state = {"reads_this_session": reads,
              "note": "doc_comments = module/item doc comments from files read this session (design invariants). "

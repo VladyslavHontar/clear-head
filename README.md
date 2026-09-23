@@ -180,6 +180,13 @@ reasoning and a worked example.
   default User-Agent outright, and since the hook fails open by default (`JEV_FAIL_CLOSED`), it
   had silently stopped checking anything — set `JEV_FAIL_CLOSED` if you'd rather be told.
 
+## Developing
+
+`python3 test_stop_verify.py` — offline checks of the decision logic (STALE rule, contradiction
+guard, confidence gate, retrieval) against a fake judge and a synthetic transcript; no network,
+no key. `replay.py <url>` measures a candidate judge against real logged sessions — see the
+Kev section for what that found.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
