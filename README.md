@@ -48,10 +48,12 @@ base) that speaks TypeSafe's exact wire contract — same `{state, questions}`, 
 `probabilities` + `confidence` — served locally by `python -m kev.serve`. `--kev` clones it into
 the hook directory, runs `uv sync --extra serve` (MLX on Apple Silicon, CUDA/ROCm elsewhere),
 starts the 4B server on `127.0.0.1:8009` and persists `VERIFIER_BACKEND=kev` in `.env`. Needs
-`uv`, `git`, ~8 GB of RAM for the weights, and a first-run download of the same size. The server
-doesn't survive a reboot; restart it with
-`cd ~/.claude/hooks/jev/kev && uv run --extra serve python -m kev.serve --run jaredpalmer/kev-4b --port 8009 &`
-or wire that into whatever you already use to keep background processes alive.
+`uv`, `git`, ~10 GB of RAM while serving, and a first-run download of ~8 GB. The server doesn't
+survive a reboot; restart it with `~/.claude/hooks/jev/kev_serve.sh &` or wire that into whatever
+you already use to keep background processes alive. Use that script rather than `python -m
+kev.serve` directly: on Apple Silicon MLX's buffer cache is unbounded by default and the server
+grew from 18 GB to 24 GB over a day of use — the script caps it at 1 GB, which holds it at ~10 GB
+with no slowdown.
 
 **What was measured, on this project's own sessions** (`replay.py`, 1309 claims with a Jev
 verdict as reference; details in the source comments):

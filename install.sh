@@ -42,6 +42,7 @@ if [ "$BACKEND" = "kev" ]; then
     && sed -i.bak '/^VERIFIER_BACKEND=/d' "$TARGET_DIR/.env" && rm -f "$TARGET_DIR/.env.bak"
   printf 'VERIFIER_BACKEND=kev\n' >> "$TARGET_DIR/.env"
 
+  cp "$SCRIPT_DIR/kev_serve.sh" "$TARGET_DIR/kev_serve.sh"; chmod +x "$TARGET_DIR/kev_serve.sh"
   [ -d "$TARGET_DIR/kev" ] || git clone -q --depth 1 https://github.com/jaredpalmer/kev "$TARGET_DIR/kev"
   (cd "$TARGET_DIR/kev" && uv sync -q --extra serve)
   if curl -s -o /dev/null -m 2 -X POST "http://127.0.0.1:$KEV_PORT/v1/systemone" -H 'Content-Type: application/json' \
@@ -49,8 +50,7 @@ if [ "$BACKEND" = "kev" ]; then
     echo "Kev already serving on port $KEV_PORT."
   else
     echo "Starting Kev in the background (first run downloads the ~8 GB kev-4b weights)..."
-    (cd "$TARGET_DIR/kev" && nohup uv run --extra serve python -m kev.serve --run jaredpalmer/kev-4b --port "$KEV_PORT" \
-       > "$TARGET_DIR/kev_server.log" 2>&1 &)
+    KEV_PORT="$KEV_PORT" nohup "$TARGET_DIR/kev_serve.sh" > "$TARGET_DIR/kev_server.log" 2>&1 &
     for i in $(seq 1 240); do
       curl -s -o /dev/null -m 2 -X POST "http://127.0.0.1:$KEV_PORT/v1/systemone" -H 'Content-Type: application/json' \
         -d '{"model":"kev-latest","state":"x","questions":{"q":{"type":"noul","instructions":"x?"}}}' && break
