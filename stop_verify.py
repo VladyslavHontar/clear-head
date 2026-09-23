@@ -332,7 +332,8 @@ def main():
                 soft.append(("low-coverage, not blocked", s, coverage[i]))
 
     with open(LOG, "a") as f:
-        f.write(json.dumps({"ts": time.time(), "session": inp.get("session_id"), "n_sent": len(sents), "n_claims": len(claims),
+        f.write(json.dumps({"ts": time.time(), "session": inp.get("session_id"), "backend": VERIFIER_BACKEND,
+                            "n_sent": len(sents), "n_claims": len(claims),
                             "blocked": bool(bad), "fact_p": {s: round(fact_p[i], 2) for i, s in claims},
                             "coverage": {s: round(coverage[i], 2) for i, s in claims}, "soft": len(soft),
                             "verdicts": {s: a2[f"c{i}"]["probabilities"] for i, s in claims},
