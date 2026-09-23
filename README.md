@@ -69,16 +69,26 @@ this hook makes for you.
 Switch backends any time by editing `VERIFIER_BACKEND` in the installed `.env` (`jev` or
 `laya`), or per-shell with `VERIFIER_BACKEND=laya`.
 
-**Honest status: not a drop-in replacement for Jev yet.** A real (small, n=3) spot-check against
-Jev on this project's own past claims — same evidence, same question wording — showed Laya's
-confidence running far below Jev's (0.05-0.13 vs 0.32-0.99) and, on one claim, pointing the wrong
-direction. `LAYA_FIRM` exists specifically so a too-high shared threshold doesn't just silently
-discard every Laya verdict, but lowering it alone doesn't fix accuracy — it just makes the hook
-act on a less certain signal. Two things nobody has done yet: tune `LAYA_FIRM`/`LAYA_CONTRA`
-against your own `log.jsonl` once you have real verdicts logged, and rewrite the question wording
-in `main()` for Laya specifically — every prompt in this hook was iterated against Jev's behavior
-all day and never touched for Laya. Treat it as a genuinely free, local, faster option worth
-having — not yet as equivalent to the default.
+**How it differs from the Jev path, and why.** Laya reads at most `LAYA_MAX_LEN` tokens of
+state and truncates from the right; it also doesn't resolve nested references like
+`claims.c3.excerpt` in a question. Sent the same batched payload as Jev (all claims, the session's
+command list, doc comments — ~20k tokens in a real session), every claim in a run came back with
+the *same* verdict, and a clean-cut synthetic contradiction scored 0.24. So on this backend the
+hook asks one question per claim with only that claim and its excerpt (~500 tokens), and
+`laya_server.py` raises the checkpoint's 512-token cap to 2048 (the encoder supports 8192). Same
+synthetic case afterwards: 0.96; on 17 real claims from a session, `contradicted` spread
+0.02–0.84 instead of a constant. ~0.3 s per claim locally, so a 50-claim answer still fits the
+hook's 60 s timeout.
+
+**Honest status.** Measured on a handful of sessions, not a benchmark. Laya's self-reported
+confidence runs far below Jev's (p50 ~0.07 vs ~0.76 on the same claims), so `LAYA_FIRM` defaults
+to 0.15 — provisional, chosen so that *something* passes the gate; calibrate it from your own
+`log.jsonl`, which records confidence per claim. Two failure modes seen: evidence about a
+different subject entirely can come back "contradicted" (the hook refuses to block on a
+contradiction when the excerpt shares no keyword with the claim, for exactly this reason), and a
+subtle in-line value swap (`0.6` vs `0.15` in the same code line) came back "not addressed" at
+low confidence — a miss, but a silent one. A free, local, private option that now does real
+per-claim work; still expect it to catch less than the default.
 
 ## Uninstall
 
@@ -125,6 +135,8 @@ documentation-first project will all need different thresholds. Start with the d
 | `JEV_FAIL_CLOSED` | unset | If the checker itself throws (network down, bad key, malformed input), fail open by default — never block real work over a broken checker. Set this if you'd rather know the check didn't run than risk it silently not running. |
 | `VERIFIER_BACKEND` | `jev` | `jev` (cloud) or `laya` (local). Persisted in `.env` by `install.sh --laya` the same way as the API key — see the Laya section above. |
 | `LAYA_HOST` / `LAYA_PORT` | `127.0.0.1` / `8787` | Where `laya_server.py` listens and where the hook looks for it. Keep the host local. |
+| `LAYA_FIRM` | 0.15 | `JEV_FIRM` for the Laya backend. Separate because the two models' confidence scales aren't comparable — see the Laya section. |
+| `LAYA_MAX_LEN` | 2048 | Token cap `laya_server.py` sets on the model (checkpoint default 512). Dial back if a checkpoint behaves worse above 512. |
 
 **On `JEV_EVIDENCE_FLOOR`:** a calibrated judge like Jev tells you whether the evidence you gave
 it *supports* a claim — it isn't built to *derive* an unstated fact, like tracing exactly what a

@@ -20,6 +20,7 @@ Setup:
 Env vars:
   LAYA_HOST    bind address (default 127.0.0.1 — keep it that way)
   LAYA_PORT    bind port (default 8787)
+  LAYA_MAX_LEN input cap in tokens (default 2048) — see the comment where it's applied
 """
 import json
 import os
@@ -27,15 +28,25 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOST = os.environ.get("LAYA_HOST", "127.0.0.1")
 PORT = int(os.environ.get("LAYA_PORT", "8787"))
+MAX_LEN = int(os.environ.get("LAYA_MAX_LEN", "2048"))
 
 try:
     from laya import Router
 except ImportError:
     raise SystemExit("laya isn't installed. Run: pip install laya")
 
-print("Loading Laya router (this happens once)...")
+print("Loading Laya router (this happens once)...", flush=True)  # nohup -> file is block-buffered
 router = Router(preload=True)
-print(f"Laya ready. Serving on http://{HOST}:{PORT}")
+# The checkpoint config caps input at max_len=512 tokens and truncates the STATE from the right
+# (laya/common.py build_sequence). A claim plus its excerpt is ~500 tokens, so at 512 the model
+# saw a cut excerpt for half the claims and its verdicts collapsed to one constant per run. The
+# encoder (ModernBERT) has 8192 positions; 2048 measurably restored per-claim discrimination
+# (spread of `contradicted` across a run: 0.02-0.81 vs 0.02-0.58 at 512) on the same claims.
+# ponytail: this is an empirical override of a training-time setting, n=17 claims — LAYA_MAX_LEN
+# exists so it can be dialed back if a checkpoint behaves worse above 512.
+for agent in router._agents.values():
+    agent.cfg["max_len"] = MAX_LEN
+print(f"Laya ready (max_len={MAX_LEN}). Serving on http://{HOST}:{PORT}", flush=True)
 
 
 class Handler(BaseHTTPRequestHandler):

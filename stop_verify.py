@@ -29,8 +29,8 @@ Env vars:
   LAYA_HOST / LAYA_PORT  where laya_server.py listens (default 127.0.0.1:8787)
   LAYA_FIRM              same as JEV_FIRM but for the laya backend — separate on purpose, see
                          the comment above FIRM: a threshold tuned for one model's calibration
-                         isn't safe to reuse for a different one (default 0.6, likely too high —
-                         calibrate from your own log.jsonl once you have real verdicts)
+                         isn't safe to reuse for a different one (default 0.15, provisional —
+                         calibrate from your own log.jsonl, which records confidence per claim)
 """
 import json, os, re, sys, urllib.request, time, pathlib, math, collections
 
@@ -272,23 +272,39 @@ def main():
 
     # Criteria wording follows TypeSafe's citation-check cookbook; nested-path references in
     # `instructions` follow their state guidance (see https://docs.typesafe.ai).
-    q2 = {f"c{i}": {"type": "choice",
-          "instructions": f"How do `doc_comments`, `claims.c{i}.excerpt` and `reads_this_session` relate to the claim `claims.c{i}.claim`?",
-          "criteria": {"supported": "the evidence states the claim or directly implies it is true",
-                       "contradicted": "the evidence states the opposite of the claim or implies it is false",
-                       "not_addressed": "the evidence does not address what the claim asserts, either way"}}
-          for i, s in claims}
+    criteria = {"supported": "the evidence states the claim or directly implies it is true",
+                "contradicted": "the evidence states the opposite of the claim or implies it is false",
+                "not_addressed": "the evidence does not address what the claim asserts, either way"}
 
     with open(SENT, "a") as f:
         f.write(json.dumps({"ts": time.time(), "session": inp.get("session_id"), "state": state}) + "\n")
-    a2 = judge(state, q2)
+    if VERIFIER_BACKEND == "laya":
+        # Laya reads at most LAYA_MAX_LEN tokens of state (see laya_server.py) and doesn't resolve
+        # nested path refs like `claims.c3.excerpt`. Batched with the shared reads (~19k tokens
+        # in a real session) and doc_comments (~900), every claim in a run got the same verdict
+        # and a clean-cut contradiction scored 0.24. One call per claim with ONLY the claim and
+        # its excerpt is what it can actually read: same case 0.96, and adding doc_comments back
+        # flattened the run again (0.27-0.54 across 17 claims). ~0.3s per call locally, so 50
+        # claims still fit the 60s hook timeout.
+        a2 = {f"c{i}": judge({"claim": s, "excerpt": state["claims"][f"c{i}"]["excerpt"]},
+                             {"q": {"type": "choice", "criteria": criteria,
+                                    "instructions": "How does `excerpt` relate to `claim`?"}})["q"]
+              for i, s in claims}
+    else:
+        q2 = {f"c{i}": {"type": "choice", "criteria": criteria,
+              "instructions": f"How do `doc_comments`, `claims.c{i}.excerpt` and `reads_this_session` relate to the claim `claims.c{i}.claim`?"}
+              for i, s in claims}
+        a2 = judge(state, q2)
 
     bad, soft = [], []
     for i, s in claims:
         r = a2[f"c{i}"]; p = r["probabilities"]
         if r.get("confidence", 1) < FIRM:
             continue  # a verdict Jev itself isn't confident in is for the log, not for blocking
-        if p.get("contradicted", 0) >= CONTRA:
+        # coverage == 0 means the excerpt shares not one keyword with the claim; a "contradiction"
+        # from evidence about a different subject is noise (Laya called "Paris is the capital of
+        # France" contradicted by "the sky is blue" at 0.78), so it's logged, never blocked.
+        if p.get("contradicted", 0) >= CONTRA and coverage[i] > 0:
             bad.append(("CONTRADICTED", s))
         elif fact_p[i] >= FACT and p.get("not_addressed", 0) >= THRESH:
             # A calibrated judge like Jev tells you whether text SUPPORTS a claim; it isn't built
