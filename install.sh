@@ -44,7 +44,9 @@ p = pathlib.Path(settings_path)
 data = json.loads(p.read_text()) if p.exists() and p.read_text().strip() else {}
 data.setdefault("hooks", {}).setdefault("Stop", [])
 cmd = f'python3 "{hook_path}"'
-if any(cmd in json.dumps(h) for h in data["hooks"]["Stop"]):
+# match on the command field itself: json.dumps escapes the quotes in cmd, so a substring test
+# against the dumped entry never matches and every re-run used to append a duplicate
+if any(hook.get("command") == cmd for h in data["hooks"]["Stop"] for hook in h.get("hooks", [])):
     print(f"Already registered in {settings_path}")
 else:
     data["hooks"]["Stop"].append({"hooks": [{"type": "command", "command": cmd, "timeout": 60}]})

@@ -28,7 +28,8 @@ if not p.exists():
 data = json.loads(p.read_text())
 cmd = f'python3 "{hook_path}"'
 stop = data.get("hooks", {}).get("Stop", [])
-kept = [h for h in stop if cmd not in json.dumps(h)]
+# match on the command field: json.dumps escapes cmd's quotes, so a substring test never matched
+kept = [h for h in stop if not any(hook.get("command") == cmd for hook in h.get("hooks", []))]
 removed = len(stop) - len(kept)
 data.setdefault("hooks", {})["Stop"] = kept
 p.write_text(json.dumps(data, indent=2))
