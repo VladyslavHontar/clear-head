@@ -179,6 +179,13 @@ reasoning and a worked example.
   of the current version — but it's still exact-word matching, not semantic, so it still misses a
   claim phrased differently from its supporting evidence, in any language.
 - It's excerpts, not full files — see "What it sends" above.
+- TypeSafe's API sits behind a Cloudflare firewall that rejects request bodies which look like
+  command injection — and a coding session's list of commands run (`curl -H ...`, `cat /sys/...`,
+  heredocs) trips it reliably. On that 403 the hook retries once without the command list, so the
+  judge sees each claim's excerpts and doc comments but not what was run to get them: a weaker
+  check for that turn, not a wrong one. Before this, the same firewall also rejected Python's
+  default User-Agent outright, and since the hook fails open by default (`JEV_FAIL_CLOSED`), it
+  had silently stopped checking anything — set `JEV_FAIL_CLOSED` if you'd rather be told.
 
 ## License
 

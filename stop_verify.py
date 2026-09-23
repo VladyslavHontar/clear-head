@@ -32,7 +32,7 @@ Env vars:
                          isn't safe to reuse for a different one (default 0.15, provisional —
                          calibrate from your own log.jsonl, which records confidence per claim)
 """
-import json, os, re, sys, urllib.request, time, pathlib, math, collections
+import json, os, re, sys, urllib.request, urllib.error, time, pathlib, math, collections
 
 HERE = pathlib.Path(__file__).parent
 LOG, SENT = HERE / "log.jsonl", HERE / "sent.jsonl"
@@ -83,13 +83,25 @@ FIRM = float(os.environ.get("LAYA_FIRM", 0.15) if VERIFIER_BACKEND == "laya"
 
 
 def jev(state, questions):
-    body = json.dumps({"model": "jev-latest", "state": state, "questions": questions}).encode()
-    # Cloudflare in front of api.typesafe.ai rejects urllib's default User-Agent with
-    # "403 error code: 1010" (browser-signature ban); any explicit UA passes.
-    req = urllib.request.Request(API, body, {"Authorization": f"Bearer {key()}", "Content-Type": "application/json",
-                                             "User-Agent": "clear-head"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.load(r)["answers"]
+    def post(st):
+        body = json.dumps({"model": "jev-latest", "state": st, "questions": questions}).encode()
+        # Cloudflare in front of api.typesafe.ai rejects urllib's default User-Agent with
+        # "403 error code: 1010" (browser-signature ban); any explicit UA passes.
+        req = urllib.request.Request(API, body, {"Authorization": f"Bearer {key()}", "Content-Type": "application/json",
+                                                 "User-Agent": "clear-head"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.load(r)["answers"]
+    try:
+        return post(state)
+    except urllib.error.HTTPError as e:
+        # The same WAF also 403s (an HTML page) on bodies that look like command injection. A
+        # coding session's command list trips it reliably — 5 commands like `curl -H`,
+        # `cat /sys/...`, a heredoc did; 66KB of prose didn't. Retry once without that list; the
+        # per-claim excerpts alone passed in every case measured. The verdicts then lack the
+        # "what was run" context, which is a weaker check, not a wrong one.
+        if e.code == 403 and "reads_this_session" in state:
+            return post({**state, "reads_this_session": "(omitted: the API's firewall rejected the command list)"})
+        raise
 
 
 def laya(state, questions):
