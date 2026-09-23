@@ -34,7 +34,9 @@ def main():
     ref = {}
     for line in open(HERE / "log.jsonl"):
         d = json.loads(line)
-        if d.get("backend", "jev") != "jev":
+        # rows older than the `backend` field: per-claim `confidence` logging predates it and was
+        # first run on a non-Jev backend, so confidence-without-backend means "not a Jev row"
+        if d.get("backend", "other" if "confidence" in d else "jev") != "jev":
             continue
         for claim, p in d.get("verdicts", {}).items():
             ref[(d.get("session"), claim)] = p

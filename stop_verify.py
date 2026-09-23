@@ -58,7 +58,6 @@ def key():
 # Read the same way as the key (env, then .env) so an installer can persist the choice — a shell
 # `export` may not reach a hook launched from a Claude Code session started elsewhere.
 VERIFIER_BACKEND = _config("VERIFIER_BACKEND", "jev")
-FIRM = float(os.environ.get(f"{VERIFIER_BACKEND.upper()}_FIRM", 0.6))
 
 
 def jev(state, questions):
@@ -83,7 +82,37 @@ def jev(state, questions):
         raise
 
 
-BACKENDS = {"jev": jev}
+KEV_URL = f"http://127.0.0.1:{os.environ.get('KEV_PORT', '8009')}/v1/systemone"
+
+
+def kev(state, questions):
+    # Same wire contract as TypeSafe (https://github.com/jaredpalmer/kev), served locally by
+    # `python -m kev.serve` — see install.sh --kev. Nothing leaves the machine on this backend.
+    body = json.dumps({"model": "kev-latest", "state": state, "questions": questions}).encode()
+    req = urllib.request.Request(KEV_URL, body, {"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=50) as r:
+            return json.load(r)["answers"]
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"VERIFIER_BACKEND=kev but {KEV_URL} isn't reachable ({e}); start the server "
+                           "(see install.sh --kev)") from e
+
+
+BACKENDS = {"jev": jev, "kev": kev}
+# Kev is a 4B model trained on states of at most 384 tokens. Given the whole batched state (all
+# claims, doc comments, nested `claims.cN.excerpt` refs) it returned near-identical verdicts for
+# every claim (spread of `contradicted` 0.01-0.10 across 18 real claims) and hit its 8192-token
+# row limit once the command list was included. One flat {claim, excerpt} call per claim is what
+# it can read in full. Prefill-bound: ~1.5 s per claim with a real ~540-token excerpt on an M1
+# Pro (0.45 s on a one-line one), plus ~10 s for the batched pass-1 — so install.sh registers the
+# hook with a 180 s timeout for this backend instead of 60.
+PER_CLAIM = {"kev"}
+# Confidence scales differ per model, so each gets its own default. Kev's 0.5 comes from replaying
+# 1309 logged claims: its "contradicted" verdicts agreed with Jev's most often at that threshold
+# (47%, vs 27% at 0.15) — and a manual check of the disagreements found both judges wrong about
+# equally often, so this is where its signal is, not proof it's right.
+FIRM_DEFAULT = {"jev": 0.6, "kev": 0.5}
+FIRM = float(os.environ.get(f"{VERIFIER_BACKEND.upper()}_FIRM", FIRM_DEFAULT.get(VERIFIER_BACKEND, 0.6)))
 
 
 def judge(state, questions):
@@ -253,23 +282,35 @@ def main():
 
     # Criteria wording follows TypeSafe's citation-check cookbook; nested-path references in
     # `instructions` follow their state guidance (see https://docs.typesafe.ai).
-    q2 = {f"c{i}": {"type": "choice",
-          "instructions": f"How do `doc_comments`, `claims.c{i}.excerpt` and `reads_this_session` relate to the claim `claims.c{i}.claim`?",
-          "criteria": {"supported": "the evidence states the claim or directly implies it is true",
-                       "contradicted": "the evidence states the opposite of the claim or implies it is false",
-                       "not_addressed": "the evidence does not address what the claim asserts, either way"}}
-          for i, s in claims}
+    criteria = {"supported": "the evidence states the claim or directly implies it is true",
+                "contradicted": "the evidence states the opposite of the claim or implies it is false",
+                "not_addressed": "the evidence does not address what the claim asserts, either way"}
 
     with open(SENT, "a") as f:
         f.write(json.dumps({"ts": time.time(), "session": inp.get("session_id"), "state": state}) + "\n")
-    a2 = judge(state, q2)
+    if VERIFIER_BACKEND in PER_CLAIM:
+        # An empty excerpt list is read as evidence by a small model — Kev answered "contradicted"
+        # at 0.85 to a claim with []; the same claim with an explicit note got "not addressed" 0.97.
+        a2 = {f"c{i}": judge({"claim": s, "excerpt": state["claims"][f"c{i}"]["excerpt"]
+                              or "(no tool output this session shares a keyword with this claim)"},
+                             {"q": {"type": "choice", "criteria": criteria,
+                                    "instructions": "How does `excerpt` relate to `claim`?"}})["q"]
+              for i, s in claims}
+    else:
+        q2 = {f"c{i}": {"type": "choice", "criteria": criteria,
+              "instructions": f"How do `doc_comments`, `claims.c{i}.excerpt` and `reads_this_session` relate to the claim `claims.c{i}.claim`?"}
+              for i, s in claims}
+        a2 = judge(state, q2)
 
     bad, soft = [], []
     for i, s in claims:
         r = a2[f"c{i}"]; p = r["probabilities"]
         if r.get("confidence", 1) < FIRM:
-            continue  # a verdict Jev itself isn't confident in is for the log, not for blocking
-        if p.get("contradicted", 0) >= CONTRA:
+            continue  # a verdict the judge itself isn't confident in is for the log, not for blocking
+        # coverage == 0: the excerpt shares not one keyword with the claim, so a "contradiction" is
+        # about something else (a local model gave 0.78 for "Paris is the capital of France" vs
+        # "the sky is blue"). Logged, never blocked — a contradiction needs evidence on the subject.
+        if p.get("contradicted", 0) >= CONTRA and coverage[i] > 0:
             bad.append(("CONTRADICTED", s))
         elif fact_p[i] >= FACT and p.get("not_addressed", 0) >= THRESH:
             # A calibrated judge like Jev tells you whether text SUPPORTS a claim; it isn't built

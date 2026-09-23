@@ -37,6 +37,41 @@ You'll be prompted for a TypeSafe API key ([get one here](https://typesafe.ai)) 
 `TYPESAFE_API_KEY` is already set in your environment. The installer verifies the key works
 before it finishes.
 
+### Local backend: Kev (no API key, nothing leaves your machine)
+
+```bash
+./install.sh --kev
+```
+
+[Kev](https://github.com/jaredpalmer/kev) is an Apache-2.0 model family (0.8B/4B/9B, Qwen3.5
+base) that speaks TypeSafe's exact wire contract — same `{state, questions}`, same
+`probabilities` + `confidence` — served locally by `python -m kev.serve`. `--kev` clones it into
+the hook directory, runs `uv sync --extra serve` (MLX on Apple Silicon, CUDA/ROCm elsewhere),
+starts the 4B server on `127.0.0.1:8009` and persists `VERIFIER_BACKEND=kev` in `.env`. Needs
+`uv`, `git`, ~8 GB of RAM for the weights, and a first-run download of the same size. The server
+doesn't survive a reboot; restart it with
+`cd ~/.claude/hooks/jev/kev && uv run --extra serve python -m kev.serve --run jaredpalmer/kev-4b --port 8009 &`
+or wire that into whatever you already use to keep background processes alive.
+
+**What was measured, on this project's own sessions** (`replay.py`, 1309 claims with a Jev
+verdict as reference; details in the source comments):
+- Kev-4b agrees with Jev on 61% of "supported", 75% of "not addressed", 12% of "contradicted".
+  A manual review of the disagreements found the two judges wrong about equally often — Kev
+  caught a real contradiction Jev called supported (tests that silently skip without an env var)
+  and Jev caught one Kev missed. Treat them as different judges, not a copy and an original.
+- Kev's known false positives: a claim whose excerpt merely *contains* a negated word ("no
+  silent fallback" vs a log line saying "fallback works") comes back "contradicted" at 0.98; and
+  an empty excerpt reads as evidence. The hook sends an explicit note instead of an empty list,
+  and never blocks on a contradiction when the excerpt shares no keyword with the claim.
+- Speed is the real cost. One call per claim (batching all claims into one state — the Jev
+  path — gave near-identical verdicts for every claim and overran Kev's 8192-token row limit
+  once the command list was included), and each call is prefill-bound: ~1.5 s for a claim with
+  a real ~540-token excerpt on an M1 Pro, plus ~10 s for the sentence-classification pass. An
+  18-sentence answer took 44 s end to end where Jev took 1 s, so `--kev` registers the hook with
+  a 180 s timeout instead of 60. Expect a noticeable pause at the end of long answers; a faster
+  GPU changes this, the code doesn't. Kev-0.8b is 5× faster and not usable: it called an
+  off-topic excerpt "supported" 0.90.
+
 ## Uninstall
 
 ```bash
@@ -80,7 +115,9 @@ documentation-first project will all need different thresholds. Start with the d
 | `JEV_EVIDENCE_FLOOR` | 0.3 | See below. |
 | `JEV_MAX_TURNS_BACK` | 20 | How many user turns of evidence to keep. Lower = less stale-evidence noise in a long session, but a recap further back than this stops being checkable. |
 | `JEV_FAIL_CLOSED` | unset | If the checker itself throws (network down, bad key, malformed input), fail open by default — never block real work over a broken checker. Set this if you'd rather know the check didn't run than risk it silently not running. |
-| `VERIFIER_BACKEND` | `jev` | Which judge answers. Always explicit — an unknown name fails loudly rather than falling back. Each backend has its own `<NAME>_FIRM` (so `JEV_FIRM` for Jev): confidence scales differ between models and can't share a threshold. |
+| `VERIFIER_BACKEND` | `jev` | `jev` (TypeSafe's API) or `kev` (local). Always explicit — an unknown name fails loudly rather than falling back. Persisted in `.env` by `install.sh --kev`. |
+| `KEV_FIRM` | 0.5 | `JEV_FIRM` for the Kev backend — separate because the two models' confidence scales differ. 0.5 is where Kev's "contradicted" verdicts agreed with Jev most often on 1309 replayed claims (47%, vs 27% at 0.15). |
+| `KEV_PORT` | 8009 | Where `kev.serve` listens (always on 127.0.0.1). |
 
 **On `JEV_EVIDENCE_FLOOR`:** a calibrated judge like Jev tells you whether the evidence you gave
 it *supports* a claim — it isn't built to *derive* an unstated fact, like tracing exactly what a
