@@ -84,7 +84,10 @@ FIRM = float(os.environ.get("LAYA_FIRM", 0.15) if VERIFIER_BACKEND == "laya"
 
 def jev(state, questions):
     body = json.dumps({"model": "jev-latest", "state": state, "questions": questions}).encode()
-    req = urllib.request.Request(API, body, {"Authorization": f"Bearer {key()}", "Content-Type": "application/json"})
+    # Cloudflare in front of api.typesafe.ai rejects urllib's default User-Agent with
+    # "403 error code: 1010" (browser-signature ban); any explicit UA passes.
+    req = urllib.request.Request(API, body, {"Authorization": f"Bearer {key()}", "Content-Type": "application/json",
+                                             "User-Agent": "clear-head"})
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.load(r)["answers"]
 
