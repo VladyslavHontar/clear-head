@@ -37,8 +37,13 @@ print(f"Removed {removed} hook entry from {settings_path}" if removed == 1 else
       f"Removed {removed} hook entries from {settings_path}")
 PY
 
+PID=$(lsof -ti tcp:"${KEV_PORT:-8009}" 2>/dev/null || true)
+if [ -n "$PID" ] && ps -o command= -p "$PID" | grep -q "kev.serve"; then
+  kill "$PID" && echo "Stopped the Kev server (pid $PID)"
+fi
+
 if [ -d "$TARGET_DIR" ]; then
-  read -rp "Also delete $TARGET_DIR (script, logs, API key)? [y/N] " ans
+  read -rp "Also delete $TARGET_DIR (script, logs, API key, Kev checkout if any)? [y/N] " ans
   if [[ "$ans" =~ ^[Yy]$ ]]; then
     rm -rf "$TARGET_DIR"
     echo "Removed $TARGET_DIR"

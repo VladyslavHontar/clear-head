@@ -15,11 +15,19 @@ Env vars:
   JEV_HOOK=off           disable for this shell (useful for an A/B comparison, or sensitive work)
   JEV_THRESH             not-addressed threshold to flag a claim as unsupported (default 0.7)
   JEV_CONTRA             contradiction threshold to block (default 0.5)
-  JEV_FACT               how confidently a sentence must read as a factual claim to be checked (default 0.7)
+  JEV_FACT               how confidently a sentence must read as a factual claim to be checked (default 0.7;
+                         per backend like FIRM — KEV_FACT defaults to 0.6, see FACT_DEFAULT)
   JEV_FIRM               minimum Jev confidence in its own verdict to act on it (default 0.6)
   JEV_EVIDENCE_FLOOR     coverage floor below which "not addressed" means nothing relevant was
                          found at all, vs. relevant evidence existing but not proving the claim
                          (default 0.3) — see the comment above EVIDENCE_FLOOR for why this exists
+  JEV_MUTABLE            how surely a sentence must read as a claim about mutable outside state
+                         (PR/CI/process/remote status) for the STALE rule to apply (default 0.7)
+  JEV_STALE_TURNS        such a claim blocks as STALE when its freshest matching evidence is this
+                         many user turns old, or there is none (default 3)
+  VERIFIER_BACKEND       which judge answers: "jev" (default). Always an explicit choice, never a
+                         silent fallback. Each backend reads its own <NAME>_FIRM (e.g. JEV_FIRM):
+                         confidence scales differ between models, so one threshold can't be shared.
 """
 import json, os, re, sys, urllib.request, urllib.error, time, pathlib, math, collections
 
@@ -27,26 +35,39 @@ HERE = pathlib.Path(__file__).parent
 LOG, SENT = HERE / "log.jsonl", HERE / "sent.jsonl"
 API = "https://api.typesafe.ai/v1/systemone"
 LINES_PER_CLAIM, CHARS_PER_CLAIM, LINE_CAP, DOC_CHARS = 12, 1200, 160, 3000
+CHUNK, READS_CAP = 25, 120  # claims per batched request; commands listed per request (see main)
 # hand-tuned starting points — every project's evidence shape differs, so these are meant to be
 # overridden via env vars once you have a few dozen logged verdicts to tune against (see README)
 THRESH = float(os.environ.get("JEV_THRESH", 0.7))
 CONTRA = float(os.environ.get("JEV_CONTRA", 0.5))
-FACT = float(os.environ.get("JEV_FACT", 0.7))
-FIRM = float(os.environ.get("JEV_FIRM", 0.6))
 EVIDENCE_FLOOR = float(os.environ.get("JEV_EVIDENCE_FLOOR", 0.3))
+# 0.7, not 0.6: a day of live use blocked "everything is pushed (#7, #4)" at 0.60 and "the tests
+# are done and found three bugs" at 0.69 — completed actions, not state that changes on its own.
+# The real case scored 0.96-0.98; nothing between 0.6 and 0.7 in 1585 logged sentences was one.
+MUTABLE = float(os.environ.get("JEV_MUTABLE", 0.7))       # see the STALE rule in main()
+STALE_TURNS = int(os.environ.get("JEV_STALE_TURNS", 3))
 STOP = set("this that with from have does into only also than then they were been what when which their about there these those would could should".split())
 
 
-def key():
-    env = os.environ.get("TYPESAFE_API_KEY", "")
+def _config(var, default=""):
+    env = os.environ.get(var, "")
     if env:
         return env
     envfile = HERE / ".env"
     if envfile.exists():
         for line in envfile.read_text().splitlines():
-            if line.startswith("TYPESAFE_API_KEY="):
+            if line.startswith(var + "="):
                 return line.split("=", 1)[1].strip()
-    return ""
+    return default
+
+
+def key():
+    return _config("TYPESAFE_API_KEY")
+
+
+# Read the same way as the key (env, then .env) so an installer can persist the choice — a shell
+# `export` may not reach a hook launched from a Claude Code session started elsewhere.
+VERIFIER_BACKEND = _config("VERIFIER_BACKEND", "jev")
 
 
 def jev(state, questions):
@@ -71,6 +92,58 @@ def jev(state, questions):
         raise
 
 
+KEV_URL = f"http://127.0.0.1:{_config('KEV_PORT', '8009')}/v1/systemone"  # env, then .env — like the key
+
+
+def kev(state, questions):
+    # Same wire contract as TypeSafe (https://github.com/jaredpalmer/kev), served locally by
+    # `python -m kev.serve` — see install.sh --kev. Nothing leaves the machine on this backend.
+    body = json.dumps({"model": "kev-latest", "state": state, "questions": questions}).encode()
+    req = urllib.request.Request(KEV_URL, body, {"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=50) as r:
+            return json.load(r)["answers"]
+    except urllib.error.URLError as e:
+        raise BackendDown(f"VERIFIER_BACKEND=kev but nothing answers at {KEV_URL} ({e.reason}). "
+                          "Start it:  ~/.claude/hooks/jev/kev_serve.sh &   (it doesn't survive a reboot)") from e
+
+
+class BackendDown(Exception):
+    """A local judge that isn't running. Unlike every other failure this one blocks even without
+    JEV_FAIL_CLOSED: after a reboot took the Kev server down, six stops in a row failed open and
+    the user worked an evening without a single check, unaware. One loud block (Claude Code's
+    stop_hook_active guard stops it repeating) beats a silent nothing."""
+
+
+BACKENDS = {"jev": jev, "kev": kev}
+# Kev is a 4B model trained on states of at most 384 tokens. Given the whole batched state (all
+# claims, doc comments, nested `claims.cN.excerpt` refs) it returned near-identical verdicts for
+# every claim (spread of `contradicted` 0.01-0.10 across 18 real claims) and hit its 8192-token
+# row limit once the command list was included. One flat {claim, excerpt} call per claim is what
+# it can read in full. Prefill-bound: ~1.5 s per claim with a real ~540-token excerpt on an M1
+# Pro (0.45 s on a one-line one), plus ~10 s for the batched pass-1 — so install.sh registers the
+# hook with a 180 s timeout for this backend instead of 60.
+PER_CLAIM = {"kev"}
+# Confidence scales differ per model, so each gets its own default. Kev's 0.5 comes from replaying
+# 1309 logged claims: its "contradicted" verdicts agreed with Jev's most often at that threshold
+# (47%, vs 27% at 0.15) — and a manual check of the disagreements found both judges wrong about
+# equally often, so this is where its signal is, not proof it's right.
+FIRM_DEFAULT = {"jev": 0.6, "kev": 0.5}
+FIRM = float(os.environ.get(f"{VERIFIER_BACKEND.upper()}_FIRM", FIRM_DEFAULT.get(VERIFIER_BACKEND, 0.6)))
+# Same for the "is this a factual claim" gate: on the same sentences Kev puts real facts at
+# 0.66-0.77 where Jev puts them at 0.79-1.00, and opinions at 0.20-0.36 vs Jev's 0.01-0.63.
+FACT_DEFAULT = {"jev": 0.7, "kev": 0.6}
+FACT = float(os.environ.get(f"{VERIFIER_BACKEND.upper()}_FACT", FACT_DEFAULT.get(VERIFIER_BACKEND, 0.7)))
+
+
+def judge(state, questions):
+    """Single dispatch point: a new backend is one function with jev()'s signature and one entry
+    in BACKENDS, not if/else scattered through main(). Unknown names fail loudly on purpose."""
+    if VERIFIER_BACKEND not in BACKENDS:
+        raise SystemExit(f"VERIFIER_BACKEND={VERIFIER_BACKEND!r} is not one of {sorted(BACKENDS)}")
+    return BACKENDS[VERIFIER_BACKEND](state, questions)
+
+
 def text_of(c):
     if isinstance(c, str):
         return c
@@ -87,7 +160,9 @@ def last_turn(path):
     in a long, multi-topic session lets a new claim match stale evidence from an unrelated earlier
     part of the conversation on generic keyword overlap alone — see README Known limits."""
     answer, all_lines, all_reads, turn, tool_desc = "", [], [], 0, {}
-    for raw in open(path):
+    with open(path) as f:
+        rows = f.readlines()
+    for raw in rows:
         try:
             d = json.loads(raw)
         except Exception:
@@ -104,7 +179,20 @@ def last_turn(path):
                         src = tool_desc.get(b.get("tool_use_id"), "")
                         tag = f"[{src}] " if src else ""
                         all_lines += [(turn, (tag + l.strip())[:LINE_CAP]) for l in text_of(b.get("content") or "").splitlines() if l.strip()]
+            elif isinstance(c, str) and c.startswith("Another Claude session sent a message"):
+                # A subagent's report comes back as a user-role row, not a tool_result. It was
+                # invisible here, so a claim relayed from it had no evidence at all and passed or
+                # failed by luck; and it bumped the turn counter as if the user had spoken. Keep it
+                # as evidence tagged [agent:...] — main() treats "only agent lines" as unverified.
+                src = re.search(r'<agent-message from="([^"]+)"', c)
+                tag = f"[agent:{src.group(1)[:8] if src else '?'}] "
+                all_lines += [(turn, (tag + l.strip())[:LINE_CAP]) for l in c.splitlines()
+                              if l.strip() and not l.lstrip().startswith("<") and "Subagent hand-back" not in l
+                              and not l.startswith("Another Claude session")]
             elif text_of(c or "").strip():
+                # the user's own words are evidence too: a number the assistant repeats from the
+                # prompt isn't an unsourced number
+                all_lines += [(turn + 1, ("[user] " + l.strip())[:LINE_CAP]) for l in text_of(c).splitlines() if l.strip()]
                 answer = ""; turn += 1
         elif d.get("type") == "assistant":
             for b in m.get("content", []):
@@ -118,14 +206,20 @@ def last_turn(path):
                         tool_desc[b["id"]] = desc[:60]
     cutoff = turn - MAX_TURNS_BACK
     lines = [l for t, l in all_lines if t >= cutoff]
+    ages = [turn - t for t, l in all_lines if t >= cutoff]  # how many user turns ago each line was produced
     reads = [r for t, r in all_reads if t >= cutoff]
-    return answer, lines, reads
+    return answer, lines, ages, reads
 
 
 def sentences(t):
+    # Fenced blocks are where run results get quoted ("test result: ok. 575 passed; 0 failed") —
+    # dropping them whole hid exactly the numbers most worth sourcing. Their digit-bearing lines
+    # are kept whole, not sentence-split: "ok." would otherwise cut the count off.
+    fenced = [l.strip() for m in re.finditer(r"```.*?```", t, flags=re.S) for l in m.group(0).splitlines()
+              if re.search(r"\d", l) and not l.startswith("```") and len(l.strip()) > 20]
     t = re.sub(r"```.*?```", " ", t, flags=re.S)
     t = re.sub(r"[#*_`|]", " ", t)
-    return [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", t) if len(s.strip()) > 40]
+    return [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", t) if len(s.strip()) > 40] + fenced
 
 
 def keywords(s):
@@ -136,10 +230,17 @@ def keywords(s):
     return {w for w in re.findall(r"[a-z][a-z0-9]{2,}|[^\W\da-z]{3,}|\d{2,}", s) if w not in STOP}
 
 
-def excerpt(claim, lines, kws, idf):
-    """Pick the tool-output lines most likely to bear on `claim`, and score how well the best
-    single line actually covers it (used later to decide whether an absence verdict means
-    "nothing relevant was read" vs. "relevant evidence exists but doesn't spell this out")."""
+def numbers(t):
+    """Numbers of 2+ digits, normalised so "1 738", "1738" and "2,5"/"2.5" compare equal."""
+    return {re.sub(r"[  ]", "", n).replace(",", ".") for n in re.findall(r"\d+(?:[  ]\d{3})*(?:[.,]\d+)?", t)
+            if len(re.sub(r"\D", "", n)) >= 2}
+
+
+def excerpt(claim, lines, kws, idf, ages):
+    """Pick the tool-output lines most likely to bear on `claim`; score how well the best single
+    line actually covers it (used later to decide whether an absence verdict means "nothing
+    relevant was read" vs. "relevant evidence exists but doesn't spell this out"); and report
+    how many turns old the freshest picked line is (None if nothing matched)."""
     kw = keywords(claim)
 
     def raw(n):  # unboosted overlap — used only to measure coverage, never to rank
@@ -155,11 +256,12 @@ def excerpt(claim, lines, kws, idf):
         return sum(idf[w] * (3 if w in lead else 1) for w in kw & kws[n])
 
     scored = sorted(((rank_score(n, l), n, l) for n, l in enumerate(lines)), reverse=True)
-    out, used = [], 0
+    out, used, fresh = [], 0, None
     for sc, n, l in scored[:LINES_PER_CLAIM]:
         if sc == 0 or used + len(l) > CHARS_PER_CLAIM:
             break
         out.append(l); used += len(l)
+        fresh = ages[n] if fresh is None else min(fresh, ages[n])
     # Coverage = the BEST SINGLE LINE's idf-weighted overlap with the claim (unboosted — the
     # position boost above is for ranking, not for this). A union across the whole excerpt is
     # easy to fool: several claim keywords can each appear somewhere, in unrelated lines, and
@@ -168,7 +270,7 @@ def excerpt(claim, lines, kws, idf):
     # signal; scattered partial matches across many lines are not.
     total_w = sum(idf.get(w, 0) for w in kw)
     coverage = max((raw(n) for _, n, _ in scored[:LINES_PER_CLAIM]), default=0.0) / total_w if total_w > 0 else 0.0
-    return out, coverage
+    return out, coverage, fresh
 
 
 def doc_lines(lines):
@@ -189,64 +291,137 @@ def main():
     inp = json.load(sys.stdin)
     if os.environ.get("JEV_HOOK", "on") == "off" or inp.get("stop_hook_active"):
         return
-    answer, lines, reads = last_turn(inp["transcript_path"])
+    answer, lines, ages, reads = last_turn(inp["transcript_path"])
     if not answer or not reads:
         return
     sents = sentences(answer)[:60]
     if not sents:
         return
+    with open(LOG, "a") as f:  # a start row: a run the harness kills (timeout) then leaves a visible gap
+        f.write(json.dumps({"ts": time.time(), "session": inp.get("session_id"), "backend": VERIFIER_BACKEND,
+                            "event": "start", "n_sent": len(sents), "n_lines": len(lines)}) + "\n")
 
     # Pass 1: which sentences are factual claims about the existing system, as opposed to
     # proposals, opinions, or a recap of the conversation itself?
     q1 = {str(i): {"type": "choice", "instructions": f"Sentence: {s}",
           "criteria": {"fact_about_existing_code": "asserts how the code/system currently is or behaves (present tense, checkable in the repo)",
-                       "proposal_or_opinion": "recommends, proposes, predicts, or describes a design that does not exist yet",
+                       # "or interprets": a day on Kev blocked "we're bottlenecked on scheduling, not the build"
+                       # and "this cements the trap the bench fell into" as unverifiable facts. Naming
+                       # interpretation here drops them (Jev 0.78 → 0.29, 0.38 → 0.01) while real facts hold.
+                       "proposal_or_opinion": "recommends, proposes, predicts, or describes a design that does not exist yet; "
+                                              "or interprets — a diagnosis of why something behaves as it does, a bottleneck claim, "
+                                              "a conclusion drawn from results, a characterization",
                        "about_this_conversation": "describes what was done, found, built, or decided during this session, what the user should do next, or asserts that something was NOT done, tested, or verified (this session or in general) — there is no code to check a claim of absent action against",
                        "other": "general knowledge, meta commentary, headings, or list fragments"}}
           for i, s in enumerate(sents)}
-    a1 = jev({"context": "Sentences from an AI assistant's answer about a software codebase. Classify each sentence "
+    # A separate axis, not a fifth category: "the PR is still open" is both a recap of this
+    # conversation AND a claim about the outside world, and a fifth mutually-exclusive label just
+    # split the probability mass (the one real case scored 0.47 as a fact, 0.96 on this noul).
+    a1 = judge({"context": "Sentences from an AI assistant's answer about a software codebase. Classify each sentence "
                          "using the full answer for context: sentences inside a proposed design are proposals even if present tense.",
               "full_answer": answer[:12000]}, q1)
     fact_p = {i: a1[str(i)]["probabilities"].get("fact_about_existing_code", 0) for i in range(len(sents))}
+    # Its own call, WITHOUT the full answer: whether a sentence asserts outside state is a property
+    # of the sentence, and the answer as context made Kev read "first, merge #36" (a next step) as
+    # a status claim at 0.94 — with the sentence alone it is 0.24, while the real case stays 0.92+.
+    qm = {f"m{i}": {"type": "noul", "instructions":
+          "Does this sentence assert the CURRENT status of something outside the repository's files that "
+          "can change on its own between checks — a pull request or issue being open/merged/closed, a CI "
+          "or test run's result, a deployment, a running process or server, a remote branch, an external "
+          "service? (Not: how code is written, what was done in this conversation, proposals.)\n"
+          f"Sentence: {s}"} for i, s in enumerate(sents)}
+    am = judge({"context": "Sentences from an AI assistant's answer about a software codebase."}, qm)
+    mutable_p = {i: 0 if a1[str(i)]["probabilities"].get("proposal_or_opinion", 0) >= 0.3 else am[f"m{i}"].get("noul", 0)
+                 for i in range(len(sents))}
     claims = list(enumerate(sents))  # verify every sentence, not just high-fact_p ones — a proposal can also be contradicted by the code
     if not claims:
         return
 
     kws = [keywords(l) for l in lines]
     df = collections.Counter(w for k in kws for w in k)
-    idf = {w: math.log(len(lines) / (1 + c)) for w, c in df.items()}
+    # smoothed so no weight is ever <= 0: with plain log(N/(1+df)) a word present in every line
+    # went negative — and with a single evidence line every word did, so coverage was 0 and a
+    # contradiction against that one line could never block
+    idf = {w: math.log((1 + len(lines)) / (1 + c)) + 1e-6 for w, c in df.items()}
 
-    state = {"reads_this_session": reads,
+    state = {"reads_this_session": reads[-READS_CAP:],
              "note": "doc_comments = module/item doc comments from files read this session (design invariants). "
                      "Each claim has its own excerpt: tool-output lines sharing rare keywords with it. Judge each "
                      "claim against doc_comments + its excerpt + the reads list. not_addressed = nothing read bears on it.",
              "doc_comments": doc_lines(lines),
              "claims": {}}
-    coverage = {}
+    coverage, fresh, relayed, unsourced = {}, {}, {}, {}
+    evidence_numbers = numbers("\n".join(lines))
     for i, s in claims:
-        exc, cov = excerpt(s, lines, kws, idf)
+        exc, cov, fr = excerpt(s, lines, kws, idf, ages)
         state["claims"][f"c{i}"] = {"claim": s, "excerpt": exc}
-        coverage[i] = cov
+        coverage[i], fresh[i] = cov, fr
+        # every matching line came from a subagent's report: the assistant is repeating, not checking
+        relayed[i] = bool(exc) and all(l.startswith("[agent:") for l in exc)
+        # a number in the claim that no tool output (or user message) in the window contains — a
+        # test count, a percentage, a line number stated with nothing to point at. The keyword
+        # retriever can't see this ("11 тестов, clippy 0" matched a neighbouring line at coverage
+        # 0.73); the UNSUPPORTED path treats it as "nothing relevant found".
+        unsourced[i] = sorted(numbers(s) - evidence_numbers)
 
     # Criteria wording follows TypeSafe's citation-check cookbook; nested-path references in
     # `instructions` follow their state guidance (see https://docs.typesafe.ai).
-    q2 = {f"c{i}": {"type": "choice",
-          "instructions": f"How do `doc_comments`, `claims.c{i}.excerpt` and `reads_this_session` relate to the claim `claims.c{i}.claim`?",
-          "criteria": {"supported": "the evidence states the claim or directly implies it is true",
-                       "contradicted": "the evidence states the opposite of the claim or implies it is false",
-                       "not_addressed": "the evidence does not address what the claim asserts, either way"}}
-          for i, s in claims}
+    criteria = {"supported": "the evidence states the claim or directly implies it is true",
+                "contradicted": "the evidence states the opposite of the claim or implies it is false",
+                "not_addressed": "the evidence does not address what the claim asserts, either way"}
 
     with open(SENT, "a") as f:
         f.write(json.dumps({"ts": time.time(), "session": inp.get("session_id"), "state": state}) + "\n")
-    a2 = jev(state, q2)
+    if VERIFIER_BACKEND in PER_CLAIM:
+        # An empty excerpt list is read as evidence by a small model — Kev answered "contradicted"
+        # at 0.85 to a claim with []; the same claim with an explicit note got "not addressed" 0.97.
+        a2 = {f"c{i}": judge({"claim": s, "excerpt": state["claims"][f"c{i}"]["excerpt"]
+                              or "(no tool output this session shares a keyword with this claim)"},
+                             {"q": {"type": "choice", "criteria": criteria,
+                                    "instructions": "How does `excerpt` relate to `claim`?"}})["q"]
+              for i, s in claims}
+    else:
+        q2 = {f"c{i}": {"type": "choice", "criteria": criteria,
+              "instructions": f"How do `doc_comments`, `claims.c{i}.excerpt` and `reads_this_session` relate to the claim `claims.c{i}.claim`?"}
+              for i, s in claims}
+        # in chunks: a 43-claim recon answer made a 120 KB request, the API answered 400, and the
+        # hook failed open on the one answer of the day that most needed checking
+        a2 = {}
+        for start in range(0, len(claims), CHUNK):
+            part = [f"c{i}" for i, _ in claims[start:start + CHUNK]]
+            a2.update(judge({**state, "claims": {k: state["claims"][k] for k in part}}, {k: q2[k] for k in part}))
 
     bad, soft = [], []
     for i, s in claims:
         r = a2[f"c{i}"]; p = r["probabilities"]
+        # A claim about mutable outside state ("the PR is still open", "the server is running")
+        # whose freshest matching evidence is STALE_TURNS old — or has none — was asserted from
+        # memory. Neither judge catches this: a stale URL or pid line reads as "on topic" (keyword
+        # coverage 0.62 on the case that prompted this) and the verdict lands on "not addressed"
+        # below every threshold. On 1585 logged sentences this fired exactly once, on that case;
+        # evidence age separated it from every claim verified the same turn (age 0). Independent
+        # of the judge's confidence on purpose: the fault is the missing check, not the verdict.
+        if mutable_p[i] >= MUTABLE and (fresh[i] is None or fresh[i] >= STALE_TURNS):
+            bad.append(("STALE", s))
+            continue
+        # The assistant saying so itself is the cheapest signal there is: "по памяти" / "from
+        # memory" / "не проверял" in a claim about the code means it wasn't checked, whatever the
+        # judge thinks of the excerpt. "не по памяти" is the opposite and is left alone.
+        if fact_p[i] >= FACT and re.search(r"(?<!не )по памяти|from memory|не проверял|не измерял|haven't (?:checked|verified)", s, re.I):
+            bad.append(("UNVERIFIED", s))
+            continue
+        # A factual claim whose only matching evidence is a subagent's report: the report is
+        # model output, not a read. Line ranges relayed this way were wrong on the same day
+        # (blockstore.rs:147-187 → actual 148 / 171-186); the reader has to look itself.
+        if fact_p[i] >= FACT and relayed[i]:
+            bad.append(("RELAYED", s))
+            continue
         if r.get("confidence", 1) < FIRM:
-            continue  # a verdict Jev itself isn't confident in is for the log, not for blocking
-        if p.get("contradicted", 0) >= CONTRA:
+            continue  # a verdict the judge itself isn't confident in is for the log, not for blocking
+        # coverage == 0: the excerpt shares not one keyword with the claim, so a "contradiction" is
+        # about something else (a local model gave 0.78 for "Paris is the capital of France" vs
+        # "the sky is blue"). Logged, never blocked — a contradiction needs evidence on the subject.
+        if p.get("contradicted", 0) >= CONTRA and coverage[i] > 0:
             bad.append(("CONTRADICTED", s))
         elif fact_p[i] >= FACT and p.get("not_addressed", 0) >= THRESH:
             # A calibrated judge like Jev tells you whether text SUPPORTS a claim; it isn't built
@@ -256,27 +431,43 @@ def main():
             # that's usually this limit, not a real gap, so it shouldn't block. Low coverage means
             # nothing relevant was read at all, which is the actual "unverified claim" this hook
             # exists to catch.
-            if coverage[i] < EVIDENCE_FLOOR:
+            if coverage[i] < EVIDENCE_FLOOR or unsourced[i]:
                 bad.append(("UNSUPPORTED", s))
             else:
                 soft.append(("low-coverage, not blocked", s, coverage[i]))
 
     with open(LOG, "a") as f:
-        f.write(json.dumps({"ts": time.time(), "session": inp.get("session_id"), "n_sent": len(sents), "n_claims": len(claims),
+        f.write(json.dumps({"ts": time.time(), "session": inp.get("session_id"), "backend": VERIFIER_BACKEND,
+                            "n_sent": len(sents), "n_claims": len(claims),
                             "blocked": bool(bad), "fact_p": {s: round(fact_p[i], 2) for i, s in claims},
                             "coverage": {s: round(coverage[i], 2) for i, s in claims}, "soft": len(soft),
-                            "verdicts": {s: a2[f"c{i}"]["probabilities"] for i, s in claims}}) + "\n")
+                            "verdicts": {s: a2[f"c{i}"]["probabilities"] for i, s in claims},
+                            "confidence": {s: a2[f"c{i}"].get("confidence") for i, s in claims},
+                            "mutable": {s: round(mutable_p[i], 2) for i, s in claims},
+                            "fresh": {s: fresh[i] for i, s in claims},
+                            "relayed": [s for i, s in claims if relayed[i]],
+                            "unsourced": {s: unsourced[i] for i, s in claims if unsourced[i]}}) + "\n")
 
     if bad:
         print(json.dumps({"decision": "block", "reason":
             "Jev claim check: these statements about the codebase are contradicted by, or absent from, "
             "what you read this session. Verify each with a read/grep, or rewrite it as an explicit "
-            "assumption, then finish.\n" + "\n".join(f"- [{k}] {s}" for k, s in bad)}))
+            "assumption, then finish. STALE = it asserts the current state of something outside the repo "
+            "(a PR, CI, a process, a remote) and nothing checked it in the last few turns — run the status "
+            "command now rather than restating it from memory. RELAYED = its only evidence is a subagent's "
+            "report — read the file or run the command yourself. UNVERIFIED = the sentence itself says it "
+            "wasn't checked. A number no tool output contains counts as unsupported.\n"
+            + "\n".join(f"- [{k}] {s}" for k, s in bad)}))
 
 
-if __name__ == "__main__":
+def run():
     try:
         main()
+    except BackendDown as e:
+        with open(LOG, "a") as f:
+            f.write(json.dumps({"ts": time.time(), "error": str(e), "backend_down": True}) + "\n")
+        print(json.dumps({"decision": "block", "reason":
+            f"clear-head could not run: {e}\nNothing was checked this turn. Tell the user, then finish."}))
     except Exception as e:
         with open(LOG, "a") as f:
             f.write(json.dumps({"ts": time.time(), "error": str(e)}) + "\n")
@@ -287,3 +478,7 @@ if __name__ == "__main__":
             print(json.dumps({"decision": "block", "reason":
                 f"Jev claim check itself failed and JEV_FAIL_CLOSED is set: {e}\n"
                 "Unset JEV_FAIL_CLOSED to fail open instead, or fix the underlying error."}))
+
+
+if __name__ == "__main__":
+    run()
