@@ -104,8 +104,15 @@ def kev(state, questions):
         with urllib.request.urlopen(req, timeout=50) as r:
             return json.load(r)["answers"]
     except urllib.error.URLError as e:
-        raise RuntimeError(f"VERIFIER_BACKEND=kev but {KEV_URL} isn't reachable ({e}); start the server "
-                           "(see install.sh --kev)") from e
+        raise BackendDown(f"VERIFIER_BACKEND=kev but nothing answers at {KEV_URL} ({e.reason}). "
+                          "Start it:  ~/.claude/hooks/jev/kev_serve.sh &   (it doesn't survive a reboot)") from e
+
+
+class BackendDown(Exception):
+    """A local judge that isn't running. Unlike every other failure this one blocks even without
+    JEV_FAIL_CLOSED: after a reboot took the Kev server down, six stops in a row failed open and
+    the user worked an evening without a single check, unaware. One loud block (Claude Code's
+    stop_hook_active guard stops it repeating) beats a silent nothing."""
 
 
 BACKENDS = {"jev": jev, "kev": kev}
@@ -453,9 +460,14 @@ def main():
             + "\n".join(f"- [{k}] {s}" for k, s in bad)}))
 
 
-if __name__ == "__main__":
+def run():
     try:
         main()
+    except BackendDown as e:
+        with open(LOG, "a") as f:
+            f.write(json.dumps({"ts": time.time(), "error": str(e), "backend_down": True}) + "\n")
+        print(json.dumps({"decision": "block", "reason":
+            f"clear-head could not run: {e}\nNothing was checked this turn. Tell the user, then finish."}))
     except Exception as e:
         with open(LOG, "a") as f:
             f.write(json.dumps({"ts": time.time(), "error": str(e)}) + "\n")
@@ -466,3 +478,7 @@ if __name__ == "__main__":
             print(json.dumps({"decision": "block", "reason":
                 f"Jev claim check itself failed and JEV_FAIL_CLOSED is set: {e}\n"
                 "Unset JEV_FAIL_CLOSED to fail open instead, or fix the underlying error."}))
+
+
+if __name__ == "__main__":
+    run()

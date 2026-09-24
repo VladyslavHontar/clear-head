@@ -55,6 +55,11 @@ kev.serve` directly: on Apple Silicon MLX's buffer cache is unbounded by default
 grew from 18 GB to 24 GB over a day of use — the script caps it at 1 GB, which holds it at ~10 GB
 with no slowdown.
 
+If the server isn't running, the hook **blocks once with the start command** instead of failing
+open — the one exception to the fail-open default. It exists because a reboot took the server
+down mid-day and the next six stops passed silently with nothing checked; a dead local judge
+should be impossible to not notice.
+
 **What was measured, on this project's own sessions** (`replay.py`, 1309 claims with a Jev
 verdict as reference; details in the source comments):
 - Kev-4b agrees with Jev on 61% of "supported", 75% of "not addressed", 12% of "contradicted".

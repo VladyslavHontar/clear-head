@@ -166,6 +166,27 @@ class Sources(unittest.TestCase):
         self.assertEqual(s.numbers("1 738 tests, 2,5 slots, v4, line 224"), {"1738", "2.5", "224"})
 
 
+class Failures(unittest.TestCase):
+    def _run(self, judge, env):
+        out = io.StringIO()
+        path = transcript([("go", [("ls", "README.md")], "Some answer about the code base here. " + PADDING)])
+        with mock.patch.dict(s.BACKENDS, {s.VERIFIER_BACKEND: judge}), mock.patch.dict(os.environ, env, clear=False), \
+             mock.patch.object(s, "LOG", pathlib.Path(tempfile.mkstemp()[1])), mock.patch.object(s, "SENT", pathlib.Path(tempfile.mkstemp()[1])), \
+             mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"session_id": "t", "transcript_path": path}))), mock.patch.object(sys, "stdout", out):
+            s.run()
+        return json.loads(out.getvalue()) if out.getvalue().strip() else None
+
+    def test_backend_down_blocks_even_when_failing_open(self):
+        def down(state, q): raise s.BackendDown("nothing answers at http://127.0.0.1:8009")
+        r = self._run(down, {"JEV_FAIL_CLOSED": ""})
+        self.assertIsNotNone(r); self.assertIn("could not run", r["reason"]); self.assertIn("8009", r["reason"])
+
+    def test_other_errors_fail_open_unless_asked(self):
+        def broken(state, q): raise KeyError("answers")
+        self.assertIsNone(self._run(broken, {"JEV_FAIL_CLOSED": ""}))
+        self.assertIsNotNone(self._run(broken, {"JEV_FAIL_CLOSED": "1"}))
+
+
 class Batching(unittest.TestCase):
     def test_pass2_is_chunked_for_batched_backends(self):
         answer = " ".join(f"Claim number {i} says the module handles case {i} correctly today." for i in range(s.CHUNK + 5))
